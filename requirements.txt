@@ -1,0 +1,59 @@
+# ==================== 核心深度学习框架 ====================
+# PyTorch CUDA 版必须通过 PyTorch 官方索引安装，pip 默认是 CPU 版
+# 本文件仅作记录，实际安装请运行:
+#   pip install torch>=2.0.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# 或根据你的 CUDA 版本选择 cu118 / cu121 / cu124
+#torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# ==================== 扩散模型相关 ====================
+diffusers>=0.21.0
+accelerate>=0.20.0
+transformers>=4.26.0
+xformers>=0.0.20
+
+# ==================== 3D 处理和渲染 ====================
+# PyTorch3D 需要从源码编译安装，命令:
+#   pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+# 注意: 必须与 PyTorch CUDA 版本匹配，换了 PyTorch 版本后需要重装
+#pytorch3d>=0.7.4  # 3D 渲染
+
+# ==================== 图像处理 ====================
+Pillow>=9.0.0
+opencv-python>=4.5.0
+scikit-image>=0.19.0
+imageio>=2.19.0
+imageio-ffmpeg>=0.4.7
+
+# ==================== 科学计算 ====================
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+
+# ==================== 数据处理和可视化 ====================
+matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.10.0
+tqdm>=4.60.0
+
+# ==================== 文件处理和工具 ====================
+pyyaml>=6.0
+toml>=0.10.0
+dataclasses-json>=0.5.0
+h5py>=3.7.0
+joblib>=1.2.0
+
+# ==================== 类型检查和代码质量 ====================
+mypy>=0.991
+types-requests>=2.28.0
+black>=22.0.0  # 代码格式化
+flake8>=4.0.0  # 代码检查
+isort>=5.10.0  # import 排序
+
+# ==================== 其他工具 ====================
+requests>=2.28.0
+psutil>=5.9.0
+gpustat>=1.0.0  # GPU 状态监控
+einops>=0.6.0  # 张量操作

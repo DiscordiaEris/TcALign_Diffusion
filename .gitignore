@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+
+# Large files
+pytorch3d-0.7.9.tar
+
+# Data
+data/
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# BFM model
+*.mat
+
+# HuggingFace downloaded models
+models/clip-vit-large-patch14/
+models/stable-diffusion-v1-5/
+
+# Large model weight files
+*.safetensors
+*.h5
+*.msgpack
