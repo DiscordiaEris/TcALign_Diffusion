@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 import logging
 import os
@@ -26,7 +26,11 @@ class BaseTrainer:
         self.optimizer = self.configure_optimizers()
 
         # 混合精度训练
-        self.scaler = GradScaler()
+        self.use_cuda_amp = torch.device(self.device).type == "cuda"
+        self.amp_dtype = torch.bfloat16 if getattr(config, "use_bf16", False) else torch.float16
+        if self.use_cuda_amp and self.amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("BF16 training requires GPU BF16 support")
+        self.scaler = GradScaler(enabled=self.use_cuda_amp and self.amp_dtype == torch.float16)
 
         # 设置日志
         self.setup_logging()
@@ -37,12 +41,27 @@ class BaseTrainer:
 
     def configure_optimizers(self):
         """配置优化器"""
-        return Adam(
-            self.model.parameters(),
+        groups = {}
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            learning_rate = self._optimizer_learning_rate(name)
+            # Coupled Adam L2 can erase pretrained attention matrices whose task
+            # gradients are small. Decouple decay, and leave biases/norms alone.
+            decay = self.config.weight_decay if parameter.ndim > 1 else 0.0
+            group = groups.setdefault((learning_rate, decay), {
+                "params": [], "lr": learning_rate, "weight_decay": decay,
+            })
+            group["params"].append(parameter)
+        return AdamW(
+            list(groups.values()),
             lr=self.config.learning_rate,
             betas=(self.config.beta1, self.config.beta2),
             weight_decay=self.config.weight_decay
         )
+
+    def _optimizer_learning_rate(self, parameter_name):
+        return self.config.learning_rate
 
     def setup_logging(self):
         """设置日志"""
@@ -62,23 +81,34 @@ class BaseTrainer:
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self.model.checkpoint_state(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
         }
-        torch.save(checkpoint, checkpoint_path)
+        if hasattr(self.config, "guidance_scale"):
+            checkpoint["inference_guidance_scale"] = self.config.guidance_scale
+            checkpoint["inference_use_bf16"] = self.config.use_bf16
+            checkpoint["inference_config"] = {
+                name: getattr(self.config, name)
+                for name in ("guidance_scale", "inference_strength", "num_inference_steps", "use_bf16")
+            }
+        from dataclasses import asdict, is_dataclass
+        if is_dataclass(self.config):
+            checkpoint["training_config"] = asdict(self.config)
+        temporary_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
         self.logger.info(f"Checkpoint saved at {checkpoint_path}")
 
     def load_checkpoint(self, checkpoint_path):
         """加载检查点"""
         if not os.path.exists(checkpoint_path):
-            self.logger.warning(f"Checkpoint {checkpoint_path} does not exist")
-            return
+            raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist")
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.load_checkpoint_state(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
@@ -87,6 +117,7 @@ class BaseTrainer:
         """训练一个epoch"""
         self.model.train()
         total_loss = 0
+        updated_steps = 0
 
         progress_bar = tqdm(self.train_dataloader, desc=f"Epoch {self.epoch}")
         for batch_idx, batch in enumerate(progress_bar):
@@ -96,18 +127,34 @@ class BaseTrainer:
             image_names = batch.get("image_name", None)
             source_params = batch.get("params", None)
             source_rendered = batch.get("rendered_image", None)
+            target_images = batch.get("target_image", None)
+            target_params = batch.get("target_params", None)
+            source_alignment = batch.get("source_alignment")
+            if source_alignment is not None:
+                source_alignment = source_alignment.to(self.device)
+            target_alignment = batch.get("target_alignment")
+            if target_alignment is not None:
+                target_alignment = target_alignment.to(self.device)
             if source_params is not None:
                 source_params = source_params.to(self.device)
             if source_rendered is not None:
                 source_rendered = source_rendered.to(self.device)
+            if target_images is not None:
+                target_images = target_images.to(self.device)
+            if target_params is not None:
+                target_params = target_params.to(self.device)
 
             # 训练步骤
-            with autocast():
+            with autocast(enabled=self.use_cuda_amp, dtype=self.amp_dtype):
                 loss_dict = self.training_step(
                     source_images, target_texts,
                     source_params=source_params,
                     source_rendered=source_rendered,
                     image_names=image_names,
+                    target_images=target_images,
+                    target_params=target_params,
+                    target_alignment=target_alignment,
+                    source_alignment=source_alignment,
                 )
                 loss = loss_dict['loss']
 
@@ -137,11 +184,12 @@ class BaseTrainer:
             if not grad_is_finite:
                 self.logger.warning(
                     f"Step {self.global_step}: gradient norm is {grad_norm.item():.4f}, "
-                    f"scaler will skip optimizer step"
+                    "skipping optimizer step"
                 )
 
-            # step + update 必须成对调用（即使梯度 NaN 也要调 update 清除 unscale 标记）
-            self.scaler.step(self.optimizer)
+            # Clear the scaler's unscale state even when the optimizer update is skipped.
+            if grad_is_finite:
+                self.scaler.step(self.optimizer)
             self.scaler.update()
 
             # 只在梯度有效时更新训练状态
@@ -150,6 +198,7 @@ class BaseTrainer:
 
             total_loss += loss.item()
             self.global_step += 1
+            updated_steps += 1
 
             # 更新进度条 (显示 loss 和 grad norm)
             progress_bar.set_postfix({
@@ -163,23 +212,27 @@ class BaseTrainer:
                 self.log_training(loss_dict, batch_idx)
 
             # 保存检查点
-            if self.global_step % self.config.save_interval == 0:
+            if self.config.save_interval > 0 and self.global_step % self.config.save_interval == 0:
                 checkpoint_path = os.path.join(
                     self.config.checkpoint_dir,
-                    f'checkpoint_step_{self.global_step}.pth'
+                    'latest_checkpoint.pth'
                 )
                 self.save_checkpoint(checkpoint_path)
 
             # 评估 (eval_interval 设得很大时可被此条件跳过, 主要靠 epoch 结束时的 eval)
-            if self.val_dataloader and self.global_step % self.config.eval_interval == 0:
+            if (self.val_dataloader and self.config.eval_interval > 0
+                    and self.global_step % self.config.eval_interval == 0):
                 self.evaluate()
+
+        if not updated_steps:
+            raise RuntimeError("No optimizer steps completed during this epoch")
 
         # 每个 epoch 结束后评估一次
         if self.val_dataloader:
             self.evaluate()
 
         self.epoch += 1
-        return total_loss / len(self.train_dataloader)
+        return total_loss / updated_steps
 
     def training_step(self, source_images, target_texts, **kwargs):
         """训练步骤，由子类实现"""
@@ -194,8 +247,12 @@ class BaseTrainer:
         log_str = f"Epoch: {self.epoch}, Step: {self.global_step}, Batch: {batch_idx}"
         for key, value in loss_dict.items():
             if hasattr(value, 'item'):
-                log_str += f", {key}: {value.item():.4f}"
-            else:
+                # 跳过非标量张量 (如 generated_images, theta_target 等)
+                try:
+                    log_str += f", {key}: {value.item():.4f}"
+                except RuntimeError:
+                    continue
+            elif isinstance(value, (int, float)):
                 log_str += f", {key}: {value:.4f}"
         self.logger.info(log_str)
 

@@ -1,0 +1,6 @@
+checkpoint_dir: ./checkpoints/fei_stage1
+log_dir: ./logs/fei_20261113
+batch_size: 4
+num_workers: 4
+save_interval: 500
+eval_interval: 0

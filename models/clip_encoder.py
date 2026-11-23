@@ -25,6 +25,7 @@ class CLIPEncoder(nn.Module):
         self.text_encoder = full_clip.text_model.to(device)
         self.vision_encoder = full_clip.vision_model.to(device)
         self.visual_projection = full_clip.visual_projection.to(device)
+        self.text_projection = full_clip.text_projection.to(device)
 
         # 冻结所有参数
         for param in self.text_encoder.parameters():
@@ -33,6 +34,14 @@ class CLIPEncoder(nn.Module):
             param.requires_grad = False
         for param in self.visual_projection.parameters():
             param.requires_grad = False
+        for param in self.text_projection.parameters():
+            param.requires_grad = False
+
+        # 开启 gradient checkpointing: 反向传播时重算中间激活而非存储
+        # 大幅降低 loss_clip 梯度链路的显存占用（24 层 ViT 激活量极大）
+        if hasattr(self.vision_encoder, 'gradient_checkpointing_enable'):
+            self.vision_encoder.gradient_checkpointing_enable()
+            print("CLIP vision encoder: gradient checkpointing enabled")
 
         self.embed_dim = self.text_encoder.config.hidden_size  # 768 for ViT-L
 
@@ -54,13 +63,14 @@ class CLIPEncoder(nn.Module):
         if isinstance(texts, str):
             texts = [texts]
 
-        inputs = self.tokenizer(texts, padding=True, return_tensors="pt")
+        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        text_embeddings = self.text_encoder(**inputs).last_hidden_state
-
-        # 使用平均池化获取句子级别的表示
-        text_embeddings = text_embeddings.mean(dim=1)
-        return text_embeddings
+        outputs = self.text_encoder(**inputs)
+        # Match CLIPModel.get_text_features: EOS pooled output followed by the
+        # learned projection. Mean-pooling hidden states is not in CLIP's joint
+        # image/text space.
+        text_embeddings = self.text_projection(outputs.pooler_output)
+        return torch.nn.functional.normalize(text_embeddings, dim=-1)
 
     def encode_image(self, images):
         """编码图像为CLIP嵌入 (输入范围: [-1, 1])
@@ -80,7 +90,7 @@ class CLIPEncoder(nn.Module):
         pooled = outputs.pooler_output
         image_embeddings = self.visual_projection(pooled)  # [batch, 768]
 
-        return image_embeddings
+        return torch.nn.functional.normalize(image_embeddings, dim=-1)
 
     def forward(self, texts=None, images=None):
         """前向传播"""

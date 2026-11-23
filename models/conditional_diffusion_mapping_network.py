@@ -1,92 +1,64 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
 
 class ConditionalDiffusionMappingNetwork(nn.Module):
-    """条件扩散映射网络 - 接收 Δθ 和源图像编码作为输入"""
+    """Map editable 3D coefficients and spatial source features to SD token residuals."""
 
     def __init__(self, config):
         super().__init__()
-        self.config = config
-
-        # 源图像编码器 (将VAE潜在表示映射到与Δθ相同的空间)
+        width = 256
         self.source_encoder = nn.Sequential(
             nn.Conv2d(4, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),  # 全局平均池化
-            nn.Flatten(),
-            nn.Linear(64, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128)  # 输出与Δθ拼接前的维度
+            nn.SiLU(),
+            nn.Conv2d(64, width, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(16, width),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d(4),
         )
-
-        # Δθ 投影层
-        self.delta_theta_projection = nn.Sequential(
-            nn.Linear(config.total_3d_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128)  # 输出与源图像编码拼接前的维度
+        self.spatial_position = nn.Parameter(torch.empty(1, 16, width))
+        self.attribute_embeddings = nn.Parameter(torch.empty(1, 3, width))
+        self.delta_encoders = nn.ModuleList(
+            nn.Sequential(nn.Linear(dim, width), nn.SiLU(), nn.Linear(width, width))
+            for dim in (config.expression_dim, config.pose_dim, config.lighting_dim)
         )
-
-        # 融合层 (拼接后的处理)
-        self.fusion_network = nn.Sequential(
-            nn.Linear(256, 512),  # 128 (图像) + 128 (Δθ) = 256
-            nn.ReLU(),
-            nn.Linear(512, 512)
+        expression_start = config.shape_dim
+        pose_start = expression_start + config.expression_dim
+        self.delta_slices = (
+            slice(expression_start, pose_start),
+            slice(pose_start, pose_start + config.pose_dim),
+            slice(-config.lighting_dim, None),
         )
-
-        # Transformer编码器
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=512,
-            nhead=8,
-            dim_feedforward=2048,
-            dropout=0.1,
-            batch_first=True
+        self.attribute_attention = nn.MultiheadAttention(width, 8, batch_first=True)
+        self.attribute_norm = nn.LayerNorm(width)
+        self.text_query = nn.Sequential(
+            nn.LayerNorm(config.condition_embed_dim),
+            nn.Linear(config.condition_embed_dim, width),
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
-
-        # 位置编码
-        self.position_embedding = nn.Parameter(
-            torch.randn(1, config.condition_seq_length, 512)
+        self.token_attention = nn.MultiheadAttention(width, 8, batch_first=True)
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, config.condition_embed_dim, bias=False),
         )
+        nn.init.normal_(self.spatial_position, std=0.02)
+        nn.init.normal_(self.attribute_embeddings, std=0.02)
+        nn.init.normal_(self.output_proj[-1].weight, std=1e-3)
 
-        # 输出投影层
-        self.output_projection = nn.Linear(512, config.condition_embed_dim)
-
-    def forward(self, delta_theta, source_latent):
-        """
-        前向传播
-
-        参数:
-            delta_theta: 3D参数差异 [batch_size, total_3d_dim]
-            source_latent: 源图像的VAE潜在表示 [batch_size, 4, H, W]
-
-        返回:
-            condition_embeddings: 条件嵌入 [batch_size, seq_len, embed_dim]
-        """
-        batch_size = delta_theta.shape[0]
-
-        # 编码源图像
-        source_encoded = self.source_encoder(source_latent)  # [batch_size, 128]
-
-        # 投影Δθ
-        delta_theta_encoded = self.delta_theta_projection(delta_theta)  # [batch_size, 128]
-
-        # 融合源图像编码和Δθ编码
-        fused = torch.cat([source_encoded, delta_theta_encoded], dim=-1)  # [batch_size, 256]
-        fused = self.fusion_network(fused)  # [batch_size, 512]
-
-        # 扩展到序列长度
-        fused = fused.unsqueeze(1)  # [batch_size, 1, 512]
-        fused = fused.expand(-1, self.config.condition_seq_length, -1)  # [batch_size, seq_len, 512]
-
-        # 添加位置编码
-        fused = fused + self.position_embedding
-
-        # 通过Transformer编码器
-        condition_embeddings = self.transformer_encoder(fused)
-
-        # 输出投影
-        condition_embeddings = self.output_projection(condition_embeddings)
-
-        return condition_embeddings
+    def forward(self, delta_theta, source_latent, text_embeddings):
+        spatial = self.source_encoder(source_latent).flatten(2).transpose(1, 2)
+        spatial = spatial + self.spatial_position
+        deltas = [delta_theta[:, group] for group in self.delta_slices]
+        # Use each attribute's actual displacement to gate its attention token.
+        magnitude = torch.stack([delta.abs().amax(dim=-1) for delta in deltas], dim=1)
+        gates = magnitude.unsqueeze(-1).tanh()
+        attributes = torch.stack(
+            [encoder(delta) for encoder, delta in zip(self.delta_encoders, deltas)], dim=1
+        )
+        attributes = attributes + self.attribute_embeddings
+        source_context, _ = self.attribute_attention(attributes, spatial, spatial, need_weights=False)
+        edit_tokens = self.attribute_norm(attributes + source_context) * gates
+        queries = self.text_query(text_embeddings)
+        residual, _ = self.token_attention(queries, edit_tokens, edit_tokens, need_weights=False)
+        # Learned attention biases must not edit the native text when all deltas are zero.
+        edit_strength = gates.amax(dim=1, keepdim=True)
+        return text_embeddings + self.output_proj(residual) * edit_strength

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, List
 import os
 import torch
-
+#abc
 
 @dataclass
 class BaseConfig:
@@ -11,10 +11,15 @@ class BaseConfig:
     seed: int = 42
 
     # 数据设置
-    data_root: str = "/path/to/ffhq"
-    image_size: int = 224
+    data_root: str = "./datasets/face_editing"
+    # SD 1.5 was trained at 512px. 224px puts its VAE/UNet far outside the
+    # training distribution and is not suitable for photo-quality editing.
+    image_size: int = 512
     batch_size: int = 32
     num_workers: int = 8
+    balance_instructions: bool = False
+    augment_instructions: bool = False
+    align_paired_targets: bool = False
 
     # 模型路径
     clip_model_name: str = "openai/clip-vit-large-patch14"
@@ -22,6 +27,7 @@ class BaseConfig:
     project_root: str = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     deep3d_repo_path: str = ""
     deep3d_checkpoint_path: str = ""
+    face_detector_path: str = ""
     deep3d_model_path: str = "/path/to/deep3d/model"
     arcface_model_path: str = "/path/to/arcface/model"
 
@@ -43,8 +49,11 @@ class BaseConfig:
     # 渲染参数
     render_image_size: int = 224  # 渲染分辨率 (匹配 CLIP 224×224，避免上采样丢失细节)
 
+    # CLIP 模型参数 (Stage1/Stage2 共用)
+    clip_embed_dim: int = 768  # CLIP ViT-L/14 joint embedding space dimension
+
     # 多模态输入和冻结设置
-    use_multimodal_input: bool = True  # UNet 是否使用多模态输入 (源图+潜在码)
+    use_multimodal_input: bool = True  # source latent/RGB are required to preserve identity
     freeze_vae: bool = True  # 是否冻结 Stable Diffusion VAE
 
     # 扩散模型参数 (Stage1/Stage2 共用)
@@ -64,6 +73,8 @@ class BaseConfig:
     max_grad_norm: float = 1.0  # 梯度裁剪阈值
     delta_theta_l2_weight: float = 0.005  # delta_theta L2 正则化权重（提升以抑制Δθ膨胀）
     delta_theta_clamp: float = 2.0  # delta_theta 裁剪范围 [-clamp, clamp]（收紧以减少渲染NaN）
+    max_clip_grad_samples: int = 1  # loss_clip 梯度链路每 batch 最多处理的样本数（限制 CLIP 显存）
+    cfg_dropout_prob: float = 0.1  # train the unconditional branch used by CFG at inference
 
     @property
     def total_3d_dim(self):
@@ -88,6 +99,10 @@ class BaseConfig:
                 self.deep3d_repo_path,
                 "BFM",
                 "BFM_model_front.mat"
+            )
+        if not self.face_detector_path:
+            self.face_detector_path = os.path.join(
+                self.project_root, "models", "face_detection_yunet_2023mar.onnx"
             )
 
         # 创建必要的目录

@@ -15,12 +15,23 @@ build/
 
 # IDE
 .idea/
+.vscode/
 
 # Large files
 pytorch3d-0.7.9.tar
 
 # Data
-data/
+/data/*
+/Deep3DFR/data/
+/logs/
+/outputs/
+!/data/__init__.py
+!/data/datasets.py
+!/data/transforms.py
+/datasets/
+/models/face_detection_yunet_2023mar.onnx
+/models/face_recognition_sface_2021dec.onnx
+/models/facenet/
 
 # Model checkpoints
 checkpoints/

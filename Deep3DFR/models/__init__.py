@@ -19,7 +19,6 @@ See our template model class 'template_model.py' for more details.
 """
 
 import importlib
-from models.base_model import BaseModel
 
 
 def find_model_using_name(model_name):
@@ -29,6 +28,8 @@ def find_model_using_name(model_name):
     be instantiated. It has to be a subclass of BaseModel,
     and it is case-insensitive.
     """
+    from .base_model import BaseModel
+
     model_filename = "models." + model_name + "_model"
     modellib = importlib.import_module(model_filename)
     model = None

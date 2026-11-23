@@ -1,0 +1,13 @@
+checkpoint_dir: ./checkpoints/fei_stage1_repair_20261120
+log_dir: ./logs/fei_repair_20261120/stage1
+output_dir: ./outputs/fei_stage1_repair_20261120
+batch_size: 4
+num_workers: 4
+num_epochs: 50
+learning_rate: 0.0002
+weight_decay: 0.0001
+balance_instructions: true
+augment_instructions: true
+save_interval: 500
+eval_interval: 0
+clip_local_path: ./models/clip-vit-large-patch14

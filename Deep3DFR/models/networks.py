@@ -15,10 +15,10 @@ try:
 except ImportError:
     from torch.utils.model_zoo import load_url as load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
-from .arcface_torch.backbones import get_model
-from kornia.geometry import warp_affine
 
 def resize_n_crop(image, M, dsize=112):
+    from kornia.geometry import warp_affine
+
     # image: (b, c, h, w)
     # M   :  (b, 2, 3)
     return warp_affine(image, M, dsize=(dsize, dsize))
@@ -107,6 +107,8 @@ class ReconNetWrapper(nn.Module):
 class RecogNetWrapper(nn.Module):
     def __init__(self, net_recog, pretrained_path=None, input_size=112):
         super(RecogNetWrapper, self).__init__()
+        from .arcface_torch.backbones import get_model
+
         net = get_model(name=net_recog, fp16=False)
         if pretrained_path:
             state_dict = torch.load(pretrained_path, map_location='cpu')

@@ -1,8 +1,11 @@
 import argparse
 import os
+import torch
 import yaml
+import random
+import numpy as np
 from configs.stage2_config import Stage2Config
-from data.datasets import create_dataset
+from data.datasets import create_dataset, create_training_sampler
 from models.tcalign_diffusion import TcAlignDiffusion
 from trainers.stage2_trainer import Stage2Trainer
 from torch.utils.data import DataLoader
@@ -23,6 +26,7 @@ def main(argv=None):
     parser.add_argument("--config", type=str, help="Path to YAML config file")
     parser.add_argument("--data_root", type=str, help="Path to FFHQ dataset root")
     parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument("--init_checkpoint", type=str, help="Initialize model weights only; start a new objective/optimizer run")
     parser.add_argument("--stage1_ckpt", type=str, required=True, help="Path to stage1 checkpoint")
     parser.add_argument("--batch_size", type=int, help="Batch size")
     parser.add_argument("--num_epochs", type=int, help="Number of epochs")
@@ -30,6 +34,8 @@ def main(argv=None):
     parser.add_argument("--clip_local_path", type=str, help="Local path to CLIP model folder")
     parser.add_argument("--diffusion_local_path", type=str, help="Local path to Stable Diffusion model folder")
     args = parser.parse_args(argv)
+    if args.resume and args.init_checkpoint:
+        parser.error("Choose either resume or init_checkpoint")
 
     # 加载配置: YAML 文件 → CLI 参数覆盖
     if args.config:
@@ -54,15 +60,20 @@ def main(argv=None):
         config.diffusion_local_path = args.diffusion_local_path
 
     config.stage1_checkpoint_path = args.stage1_ckpt
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+    np.random.seed(config.seed)
 
     # 创建数据加载器
     train_dataset = create_dataset(config, "train")
     val_dataset = create_dataset(config, "val")
+    train_sampler = create_training_sampler(train_dataset, config)
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=config.num_workers
     )
 
@@ -78,6 +89,13 @@ def main(argv=None):
 
     # 创建训练器
     trainer = Stage2Trainer(config, model, train_dataloader, val_dataloader)
+
+    if args.init_checkpoint:
+        checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+        model.load_checkpoint_state(checkpoint["model_state_dict"])
+        trainer.logger.info("Initialized weights from %s at step %s; new optimizer/objective",
+                            args.init_checkpoint, checkpoint.get("global_step"))
+        del checkpoint
 
     # 恢复训练（如果指定）
     if args.resume:

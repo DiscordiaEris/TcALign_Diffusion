@@ -1,8 +1,11 @@
 import argparse
 import os
 import yaml
+import random
+import numpy as np
+import torch
 from configs.stage1_config import Stage1Config
-from data.datasets import create_dataset
+from data.datasets import create_dataset, create_training_sampler
 from models.tcalign_diffusion import TcAlignDiffusion
 from trainers.stage1_trainer import Stage1Trainer
 from torch.utils.data import DataLoader
@@ -50,14 +53,20 @@ def main(argv=None):
     if args.clip_local_path:
         config.clip_local_path = args.clip_local_path
 
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+
     # 创建数据加载器
     train_dataset = create_dataset(config, "train")
     val_dataset = create_dataset(config, "val")
+    train_sampler = create_training_sampler(train_dataset, config)
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=config.num_workers
     )
 

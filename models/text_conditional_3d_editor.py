@@ -1,3 +1,5 @@
+import re
+
 import torch
 import torch.nn as nn
 from .attribute_embedding_space import AttributeEmbeddingSpace
@@ -10,15 +12,23 @@ class TextConditional3DEditor(nn.Module):
     _ATTR_ANCHORS = {
         'expression': ['smile', 'smiling', 'angry', 'surprised', 'sad', 'neutral',
                        'happy', 'frown', 'grin', 'laugh', 'expression', 'emotion'],
-        'pose': ['front', 'side', 'left', 'right', 'turn', 'tilt', 'pose',
-                 'looking', 'facing', 'angle', 'view', 'head'],
+        'pose': ['front', 'frontal', 'turn', 'tilt', 'pose', 'look', 'looking',
+                 'facing', 'angle', 'view', 'yaw', 'pitch', 'profile', 'rotate'],
         'lighting': ['bright', 'dim', 'dark', 'natural', 'studio', 'soft',
-                     'shadow', 'lighting', 'illumination', 'lit'],
+                     'shadow', 'lighting', 'illumination', 'light', 'lit', 'relight'],
     }
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        expression_start = config.shape_dim
+        pose_start = expression_start + config.expression_dim
+        lighting_start = pose_start + config.pose_dim + config.texture_dim
+        self.attribute_slices = {
+            "expression": slice(expression_start, pose_start),
+            "pose": slice(pose_start, pose_start + config.pose_dim),
+            "lighting": slice(lighting_start, config.total_3d_dim),
+        }
 
         # 属性嵌入空间
         self.aes = AttributeEmbeddingSpace(
@@ -53,13 +63,22 @@ class TextConditional3DEditor(nn.Module):
         对训练数据模板 "A face with {expr} expression, {pose}, {lighting}" 覆盖良好，
         对自由文本也会通过锚点词做更鲁棒的推断。
         """
-        text_lower = text.lower()
+        words = set(re.findall(r"[a-z]+", text.lower()))
         attributes = []
         for attr, anchors in self._ATTR_ANCHORS.items():
-            if any(word in text_lower for word in anchors):
+            if words.intersection(anchors):
                 attributes.append(attr)
+        if not attributes and words.intersection({"left", "right", "side"}):
+            attributes.append("pose")
         # 如果没有任何匹配，默认编辑所有可用属性
         return attributes if attributes else list(self.aes.attribute_dims.keys())
+
+    def attribute_mask(self, attributes, reference):
+        mask = torch.zeros_like(reference, dtype=torch.bool)
+        for row, selected in enumerate(attributes):
+            for attribute in selected:
+                mask[row, self.attribute_slices[attribute]] = True
+        return mask
 
     def forward(self, e_img, e_txt, texts=None, return_manipulated=False):
         """
@@ -87,7 +106,7 @@ class TextConditional3DEditor(nn.Module):
         e_manipulated = self.aes.manipulate(e_img, e_txt, target_attributes)
 
         # 预测3D参数变化量（作为Δθ）
-        delta_theta = self.theta_predictor(e_manipulated)
+        delta_theta = self.theta_predictor(e_manipulated).float()
 
         # 安全裁剪：防止极端 Δθ 导致 PyTorch3D 渲染器产生 NaN
         delta_theta = torch.clamp(
@@ -95,6 +114,7 @@ class TextConditional3DEditor(nn.Module):
             min=-self.config.delta_theta_clamp,
             max=self.config.delta_theta_clamp,
         )
+        delta_theta = delta_theta.masked_fill(~self.attribute_mask(target_attributes, delta_theta), 0)
 
         if return_manipulated:
             return delta_theta, e_manipulated

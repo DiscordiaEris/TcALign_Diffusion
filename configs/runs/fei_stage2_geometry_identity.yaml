@@ -1,0 +1,17 @@
+checkpoint_dir: ./checkpoints/fei_stage2_geometry_identity
+log_dir: ./logs/fei_geometry_identity_20261117
+output_dir: ./outputs/fei_stage2_geometry_identity
+batch_size: 1
+num_workers: 4
+num_epochs: 100
+learning_rate: 0.0001
+log_interval: 50
+save_interval: 500
+eval_interval: 0
+use_geometry_adapter: true
+measured_geometry_probability: 0.5
+lambda_3d: 0.3
+lambda_id: 0.5
+identity_weights_path: ./models/facenet/vggface2.pt
+guidance_scale: 2.5
+use_bf16: true

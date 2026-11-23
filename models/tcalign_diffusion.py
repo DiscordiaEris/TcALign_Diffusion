@@ -1,13 +1,17 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from .clip_encoder import CLIPEncoder
-from .text_conditional_3d_editor import TextConditional3DEditor
-from .conditional_diffusion_mapping_network import ConditionalDiffusionMappingNetwork
-from .diffusion_unet_wrapper import DiffusionUNetWrapper
+
 from utils.deep3d_utils import load_deep3d_model
 from utils.pytorch3d_renderer import PyTorch3DRenderer
+from utils.losses import (make_edit_training_pair, requested_attribute_control_loss,
+                         requested_lighting_exposure_loss)
+from .clip_encoder import CLIPEncoder
+from .conditional_diffusion_mapping_network import ConditionalDiffusionMappingNetwork
+from .diffusion_unet_wrapper import DiffusionUNetWrapper
+from .geometry_adapter import align_geometry
+from .text_conditional_3d_editor import TextConditional3DEditor
 
 
 class TcAlignDiffusion(nn.Module):
@@ -33,6 +37,7 @@ class TcAlignDiffusion(nn.Module):
         # 扩散模块延迟加载 (Stage 1 不需要, 避免无网络时下载 SD 模型)
         self.diffusion_mapper = None
         self.diffusion_unet = None
+        self.identity_loss = None
 
         print("TcAlignDiffusion model initialized successfully")
         print(f"Using multimodal input: {config.use_multimodal_input}")
@@ -40,16 +45,40 @@ class TcAlignDiffusion(nn.Module):
     def _init_diffusion_modules(self):
         """延迟初始化扩散模块 (Stage 2 或推理时首次调用)"""
         if self.diffusion_mapper is None:
-            self.diffusion_mapper = ConditionalDiffusionMappingNetwork(self.config)
+            self.diffusion_mapper = ConditionalDiffusionMappingNetwork(self.config).to(self.device)
         if self.diffusion_unet is None:
-            self.diffusion_unet = DiffusionUNetWrapper(self.config)
+            self.diffusion_unet = DiffusionUNetWrapper(self.config).to(self.device)
 
-    def get_3d_params(self, image_tensor):
+    def _checkpoint_keys(self):
+        return {name for name, param in self.named_parameters()
+                if param.requires_grad or name.startswith("text_3d_editor.")}
+
+    def initialize_identity_loss(self):
+        if self.config.lambda_id and self.identity_loss is None:
+            from .face_identity_loss import FaceIdentityLoss
+
+            self.identity_loss = FaceIdentityLoss(self.config.identity_weights_path).to(self.device).eval()
+
+    def checkpoint_state(self):
+        keys = self._checkpoint_keys()
+        return {name: tensor for name, tensor in self.state_dict().items() if name in keys}
+
+    def load_checkpoint_state(self, state):
+        expected = self._checkpoint_keys()
+        missing = expected - state.keys()
+        unknown = state.keys() - self.state_dict().keys()
+        if missing or unknown:
+            raise RuntimeError(f"Incompatible checkpoint: missing {sorted(missing)}, "
+                               f"unknown {sorted(unknown)}")
+        self.load_state_dict(state, strict=False)
+
+    def get_3d_params(self, image_tensor, *, return_alignment=False):
         """从图像获取3D参数（支持batch）"""
         # 确保图像在正确的范围内 [-1, 1]
         image_tensor = torch.clamp(image_tensor, -1, 1)
 
         batch_params = []
+        alignments = []
         # Deep3DProcessor.process 目前对单张图像设计
         for i in range(image_tensor.shape[0]):
             params = self.deep3d_processor.process(image_tensor[i:i+1])
@@ -61,10 +90,15 @@ class TcAlignDiffusion(nn.Module):
                 params['lighting'].flatten()
             ])
             batch_params.append(torch.FloatTensor(all_params))
+            if return_alignment:
+                alignments.append(torch.from_numpy(params["alignment"]))
 
-        return torch.stack(batch_params).to(self.device)
+        coefficients = torch.stack(batch_params).to(self.device)
+        if return_alignment:
+            return coefficients, torch.stack(alignments).to(self.device)
+        return coefficients
 
-    def render_from_params(self, params):
+    def render_from_params(self, params, *, geometry=False):
         """从3D参数渲染图像 (params: [batch, total_3d_dim])
 
         直接使用 PyTorch3D 可微渲染管线，保留梯度用于 end-to-end 训练。
@@ -84,193 +118,217 @@ class TcAlignDiffusion(nn.Module):
             'lighting': params[:, sd + ed + pd + td:sd + ed + pd + td + ld],
         }
 
-        return self.renderer.render(tensor_params)
+        return self.renderer.render(tensor_params, geometry=geometry)
 
     def encode_source_images(self, source_images):
         """编码源图像到潜在空间"""
         self._init_diffusion_modules()
-        source_latents = self.diffusion_unet.encode_image(source_images)
+        source_latents = self.diffusion_unet.encode_image(source_images, deterministic=True)
         return source_latents
 
-    def forward(self, source_images, target_texts, training_mode="diffusion", theta_0=None):
-        """
-        前向传播
+    def train(self, mode=True):
+        super().train(mode)
+        self.clip_encoder.eval()
+        if not any(p.requires_grad for p in self.text_3d_editor.parameters()):
+            self.text_3d_editor.eval()
+        return self
 
-        参数:
-            source_images: 源图像 [batch_size, C, H, W]
-            target_texts: 目标文本列表 [batch_size]
-            training_mode: "3d_editor" 或 "diffusion"
-            theta_0: 预计算的 3D 参数 [batch, total_3d_dim]，跳过 Deep3D 推理
-        """
+    def predict_delta(self, theta_0, texts, rendered=None):
+        if rendered is None:
+            rendered = self.render_from_params(theta_0)
+        with torch.no_grad():
+            image_embedding = self.clip_encoder.encode_image(rendered)
+            text_embedding = self.clip_encoder.encode_text(texts)
+        return self.text_3d_editor(image_embedding, text_embedding, texts)
+
+    def forward(self, source_images, target_texts, training_mode="diffusion",
+                theta_0=None, target_images=None, target_theta=None, source_rendered=None,
+                target_alignment=None, source_alignment=None):
+        if theta_0 is None:
+            theta_0, estimated_alignment = self.get_3d_params(source_images, return_alignment=True)
+            if source_alignment is None:
+                source_alignment = estimated_alignment
         if training_mode == "3d_editor":
-            return self.forward_3d_editor(source_images, target_texts)
-        elif training_mode == "diffusion":
-            return self.forward_diffusion(source_images, target_texts, theta_0=theta_0)
-        else:
+            return {"delta_theta": self.predict_delta(theta_0, target_texts, source_rendered),
+                    "theta_0": theta_0}
+        if training_mode != "diffusion":
             raise ValueError(f"Unknown training mode: {training_mode}")
+        if target_images is None or target_theta is None:
+            raise ValueError("Diffusion training requires real paired target images and 3D coefficients")
 
-    def forward_3d_editor(self, source_images, target_texts):
-        """3D编辑器前向传播"""
-        # 获取源图像的3D参数
-        theta_0 = self.get_3d_params(source_images)
+        if (self.config.lambda_3d or self.config.lambda_id or self.config.lambda_control) and target_alignment is None:
+            raise ValueError("3D consistency requires the target portrait's cached face alignment")
+        if (self.config.lambda_id or self.config.lambda_control or self.config.lambda_lighting_exposure) and source_alignment is None:
+            raise ValueError("Identity supervision requires the source portrait's cached face alignment")
 
-        # 获取源图像的渲染图
-        rendered_0 = self.render_from_params(theta_0)
-
-        # 提取CLIP嵌入
-        with torch.no_grad():
-            e_img = self.clip_encoder.encode_image(rendered_0)
-            e_txt = self.clip_encoder.encode_text(target_texts)
-
-        # 通过3D编辑器预测3D参数变化
-        delta_theta = self.text_3d_editor(e_img, e_txt, target_texts)
-
-        return {"delta_theta": delta_theta, "theta_0": theta_0}
-
-    def forward_diffusion(self, source_images, target_texts, theta_0=None):
-        """扩散模型前向传播 - 完整使用VAE和多模态输入
-
-        参数:
-            theta_0: 预计算的 3D 参数 [batch, total_3d_dim]。传入则跳过 Deep3D 推理。
-        """
         self._init_diffusion_modules()
-        batch_size = source_images.shape[0]
-
-        # 获取源图像的3D参数 (优先使用预计算值)
+        self.initialize_identity_loss()
+        diffusion = self.diffusion_unet
+        if diffusion.geometry_adapter is not None and source_alignment is None:
+            raise ValueError("Spatial geometry requires the source portrait's cached face alignment")
         with torch.no_grad():
-            if theta_0 is None:
-                theta_0 = self.get_3d_params(source_images)
-
-        # 获取源图像的渲染图
-        rendered_0 = self.render_from_params(theta_0)
-
-        # 提取CLIP嵌入
-        with torch.no_grad():
-            e_img = self.clip_encoder.encode_image(rendered_0)
-            e_txt = self.clip_encoder.encode_text(target_texts)
-
-        # 通过3D编辑器预测目标3D参数
-        delta_theta_pred = self.text_3d_editor(e_img, e_txt, target_texts)
-        theta_target = theta_0 + delta_theta_pred
-
-        # 计算Δθ
-        delta_theta = theta_target - theta_0
-
-        # 编码源图像到潜在空间
-        source_latents = self.encode_source_images(source_images)
-
-        # 通过扩散映射网络获取条件嵌入
-        condition_embeddings = self.diffusion_mapper(delta_theta, source_latents)
-
-        # 准备扩散过程
-        noise = torch.randn_like(source_latents)
-        timesteps = torch.randint(
-            0, self.config.num_train_timesteps,
-            (batch_size,), device=self.device
-        ).long()
-
-        # 添加噪声
-        noisy_latents = self.diffusion_unet.add_noise(source_latents, noise, timesteps)
-
-        # 预测噪声 (使用多模态输入)
-        noise_pred = self.diffusion_unet(
-            noisy_latents, timesteps, condition_embeddings, source_images, source_latents
+            delta = self.predict_delta(theta_0, target_texts, source_rendered)
+            geometry = None
+            if diffusion.geometry_adapter is not None:
+                # Paired renders teach the spatial correspondence. Predicted renders
+                # expose the denoiser to the editor errors it will see at inference.
+                if self.training and self.config.measured_geometry_probability > 0:
+                    editor = self.text_3d_editor
+                    mask = editor.attribute_mask([editor.parse_attributes(text) for text in target_texts], theta_0)
+                    measured = (target_theta - theta_0).masked_fill(~mask, 0)
+                    use_measured = torch.rand(len(delta), 1, device=delta.device)
+                    delta = torch.where(use_measured < self.config.measured_geometry_probability, measured, delta)
+                geometry = align_geometry(
+                    self.render_from_params(theta_0 + delta, geometry=True),
+                    source_alignment, source_images.shape[-2:],
+                )
+            source_latents = self.encode_source_images(source_images)
+            target_latents = diffusion.encode_image(target_images)
+            dropped = torch.rand(len(delta), device=delta.device) < self.config.cfg_dropout_prob
+            if not self.training:
+                dropped.fill_(False)
+            prompts = ["" if drop else text for text, drop in zip(target_texts, dropped.tolist())]
+            text_embeddings = diffusion.encode_prompt(prompts)
+        condition = self.diffusion_mapper(
+            delta.masked_fill(dropped[:, None], 0), source_latents, text_embeddings
         )
-
-        # 基础扩散损失
-        loss_diffusion = F.mse_loss(noise_pred, noise)
-
-        # 3D一致性损失
-        with torch.no_grad():
-            # 解码生成图像
-            generated_images = self.diffusion_unet.decode_latent(noisy_latents)
-
-            # 预测生成图像的3D参数
-            theta_pred = self.get_3d_params(generated_images)
-
-        loss_3d = F.mse_loss(theta_pred, theta_target)
-
-        # 身份保持损失 (使用ArcFace或像素级相似度)
-        loss_id = F.mse_loss(generated_images, source_images)
-
-        # CLIP对齐损失
-        with torch.no_grad():
-            clip_emb_gen = self.clip_encoder.encode_image(generated_images)
-
-        loss_clip = 1 - F.cosine_similarity(clip_emb_gen, e_txt, dim=-1).mean()
-
-        # VAE损失 (如果训练VAE)
-        loss_vae = torch.tensor(0.0, device=self.device)
-        if not self.config.freeze_vae:
-            loss_vae, _, _ = self.diffusion_unet.compute_vae_loss(
-                source_images, generated_images, self.config.vae_kl_weight
+        noise = torch.randn_like(target_latents)
+        timesteps = torch.randint(self.config.num_train_timesteps, (len(delta),), device=delta.device)
+        source_anchor = ((torch.rand(len(delta), device=delta.device) < self.config.source_edit_probability)
+                         & ~dropped)
+        if source_anchor.any():
+            edit_timesteps = torch.randint(
+                self.config.source_edit_min_timestep, self.config.source_edit_max_timestep,
+                timesteps.shape, device=timesteps.device,
             )
-
-        # 总损失
-        total_loss = (
-                self.config.lambda_diffusion * loss_diffusion +
-                self.config.lambda_3d * loss_3d +
-                self.config.lambda_id * loss_id +
-                self.config.lambda_clip * loss_clip +
-                self.config.lambda_vae * loss_vae
+            timesteps = torch.where(source_anchor, edit_timesteps, timesteps)
+        scheduler = diffusion.noise_scheduler
+        noisy, effective_noise = make_edit_training_pair(
+            scheduler, target_latents, source_latents, noise, timesteps, source_anchor,
         )
+        geometry_residuals = diffusion.geometry_features(geometry, noisy.shape[-2:])
+        prediction = diffusion(noisy, timesteps, condition, source_images, source_latents,
+                               geometry_residuals=geometry_residuals)
+        if scheduler.config.prediction_type == "epsilon":
+            denoising_target = effective_noise
+        elif scheduler.config.prediction_type == "v_prediction":
+            denoising_target = scheduler.get_velocity(target_latents, effective_noise, timesteps)
+        else:
+            denoising_target = target_latents
+        loss_diffusion = F.mse_loss(prediction.float(), denoising_target.float())
 
-        return {
-            "loss": total_loss,
-            "loss_diffusion": loss_diffusion,
-            "loss_3d": loss_3d,
-            "loss_id": loss_id,
-            "loss_clip": loss_clip,
-            "loss_vae": loss_vae,
-            "generated_images": generated_images,
-            "theta_target": theta_target
-        }
+        alpha = scheduler.alphas_cumprod.to(noisy.device)[timesteps, None, None, None]
+        if scheduler.config.prediction_type == "epsilon":
+            predicted_clean = (noisy - (1 - alpha).sqrt() * prediction) / alpha.sqrt().clamp_min(1e-4)
+        elif scheduler.config.prediction_type == "v_prediction":
+            predicted_clean = alpha.sqrt() * noisy - (1 - alpha).sqrt() * prediction
+        else:
+            predicted_clean = prediction.float()
+        loss = self.config.lambda_diffusion * loss_diffusion
+        losses = {"loss_diffusion": loss_diffusion,
+                  "source_edit_fraction": source_anchor.float().mean()}
+        mid_noise = (timesteps >= 100) & (timesteps < self.config.auxiliary_max_timestep)
+        if self.config.lambda_diffusion_edit and mid_noise.any():
+            edit_loss = F.mse_loss(predicted_clean[mid_noise], target_latents[mid_noise])
+            loss = loss + self.config.lambda_diffusion_edit * edit_loss
+            losses["loss_diffusion_edit"] = edit_loss
+
+        editable = ((timesteps < self.config.auxiliary_max_timestep) & ~dropped).nonzero(as_tuple=True)[0]
+        if len(editable) and (self.config.lambda_clip or self.config.lambda_3d or self.config.lambda_id or self.config.lambda_control or self.config.lambda_lighting_exposure):
+            indices = editable[:self.config.max_clip_grad_samples]
+            predicted_images = diffusion.decode_latent_train(predicted_clean[indices])
+            real_images = target_images[indices]
+            if self.config.lambda_lighting_exposure:
+                attributes = [self.text_3d_editor.parse_attributes(target_texts[i]) for i in indices.tolist()]
+                exposure_loss = requested_lighting_exposure_loss(
+                    predicted_images, source_images[indices], real_images,
+                    source_alignment[indices], attributes,
+                )
+                loss = loss + self.config.lambda_lighting_exposure * exposure_loss
+                losses["loss_lighting_exposure"] = exposure_loss
+            if self.identity_loss is not None:
+                identity_loss = self.identity_loss(
+                    predicted_images, source_images[indices], real_images,
+                    source_alignment[indices], target_alignment[indices],
+                )
+                loss = loss + self.config.lambda_id * identity_loss
+                losses["loss_identity"] = identity_loss
+            if self.config.lambda_clip:
+                with torch.no_grad():
+                    target_embedding = self.clip_encoder.encode_image(real_images)
+                pred_embedding = self.clip_encoder.encode_image(predicted_images)
+                clip_loss = 1 - F.cosine_similarity(pred_embedding.float(), target_embedding.float()).mean()
+                loss = loss + self.config.lambda_clip * clip_loss
+                losses["loss_clip"] = clip_loss
+            if self.config.lambda_3d or self.config.lambda_control:
+                # Use the same spatial frame for predicted/target images. Deep3D's
+                # frozen network remains differentiable with respect to generated pixels.
+                pred_coeff = self.deep3d_processor.reconstruct_aligned(
+                    predicted_images, target_alignment[indices]
+                )
+                with torch.no_grad():
+                    real_coeff = self.deep3d_processor.reconstruct_aligned(
+                        real_images, target_alignment[indices]
+                    )
+                if self.config.lambda_3d:
+                    errors = []
+                    for name, group in self.text_3d_editor.attribute_slices.items():
+                        scale = 3.0 if name == "pose" and geometry is not None else 1.0
+                        errors.append(F.smooth_l1_loss(pred_coeff[:, group] * scale, real_coeff[:, group] * scale))
+                    geometry_loss = torch.stack(errors).mean()
+                    loss = loss + self.config.lambda_3d * geometry_loss
+                    losses["loss_3d"] = geometry_loss
+                if self.config.lambda_control:
+                    with torch.no_grad():
+                        source_coeff = self.deep3d_processor.reconstruct_aligned(
+                            source_images[indices], source_alignment[indices])
+                    attributes = [self.text_3d_editor.parse_attributes(target_texts[i]) for i in indices.tolist()]
+                    control_loss = requested_attribute_control_loss(
+                        pred_coeff, source_coeff, real_coeff, attributes,
+                        self.text_3d_editor.attribute_slices,
+                    )
+                    loss = loss + self.config.lambda_control * control_loss
+                    losses["loss_control"] = control_loss
+
+        losses["loss"] = loss
+        losses["theta_target"] = theta_0 + delta
+        return losses
 
     @torch.no_grad()
-    def generate(self, source_images, target_texts, guidance_scale=7.5, num_inference_steps=50):
-        """生成图像 - 完整使用VAE和多模态输入"""
+    def generate(self, source_images, target_texts, guidance_scale=7.5, num_inference_steps=50,
+                 *, strength=None, generator=None, theta_0=None, source_rendered=None,
+                 estimate_final_theta=True, delta_theta=None, use_geometry=True,
+                 source_alignment=None):
         self._init_diffusion_modules()
-        batch_size = source_images.shape[0]
-
-        # 获取源图像的3D参数
-        theta_0 = self.get_3d_params(source_images)
-
-        # 获取源图像的渲染图
-        rendered_0 = self.render_from_params(theta_0)
-
-        # 提取CLIP嵌入
-        e_img = self.clip_encoder.encode_image(rendered_0)
-        e_txt = self.clip_encoder.encode_text(target_texts)
-
-        # 通过3D编辑器预测目标3D参数
-        delta_theta_pred = self.text_3d_editor(e_img, e_txt, target_texts)
-        theta_target = theta_0 + delta_theta_pred
-
-        # 计算Δθ
-        delta_theta = theta_target - theta_0
-
-        # 编码源图像到潜在空间
+        diffusion = self.diffusion_unet
+        if strength is None:
+            strength = self.config.inference_strength
+        spatial = use_geometry and diffusion.geometry_adapter is not None
+        if spatial and source_alignment is None:
+            estimated_theta, source_alignment = self.get_3d_params(source_images, return_alignment=True)
+            if theta_0 is None:
+                theta_0 = estimated_theta
+        elif theta_0 is None and (delta_theta is None or spatial):
+            theta_0 = self.get_3d_params(source_images)
+        if delta_theta is None:
+            delta_theta = self.predict_delta(theta_0, target_texts, source_rendered)
         source_latents = self.encode_source_images(source_images)
-
-        # 通过扩散映射网络获取条件嵌入
-        condition_embeddings = self.diffusion_mapper(delta_theta, source_latents)
-
-        # 使用扩散模型采样生成图像 (使用多模态输入)
-        generated_latents = self.diffusion_unet.sample(
-            condition_embeddings,
-            source_images,
-            source_latents,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps
+        geometry = None
+        if spatial:
+            geometry = align_geometry(
+                self.render_from_params(theta_0 + delta_theta, geometry=True),
+                source_alignment, source_images.shape[-2:],
+            )
+        condition = self.diffusion_mapper(delta_theta, source_latents, diffusion.encode_prompt(target_texts))
+        generated_latents = diffusion.sample(
+            condition, source_images, source_latents, guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps, generator=generator, strength=strength,
+            geometry=geometry,
         )
-
-        # 解码潜在代码
-        generated_images = self.diffusion_unet.decode_latent(generated_latents)
-
-        # 使用3D预测器生成最终参数
-        final_theta = self.get_3d_params(generated_images)
-
-        return generated_images, final_theta
+        images = diffusion.decode_latent(generated_latents)
+        if not estimate_final_theta:
+            return images, None
+        return images, self.get_3d_params(images)
 
     def train_vae_only(self, source_images):
         """仅训练VAE (如果VAE未冻结)"""
@@ -279,14 +337,12 @@ class TcAlignDiffusion(nn.Module):
             print("VAE is frozen, skipping VAE-only training")
             return torch.tensor(0.0, device=self.device)
 
-        # 编码-解码流程
-        source_latents = self.encode_source_images(source_images)
-        reconstructed_images = self.diffusion_unet.decode_latent(source_latents)
-
-        # 计算VAE损失
-        vae_loss, recon_loss, kl_loss = self.diffusion_unet.compute_vae_loss(
-            source_images, reconstructed_images, self.config.vae_kl_weight
-        )
+        vae = self.diffusion_unet.vae
+        posterior = vae.encode(source_images).latent_dist
+        reconstructed_images = vae.decode(posterior.sample()).sample
+        recon_loss = F.mse_loss(reconstructed_images, source_images)
+        kl_loss = posterior.kl().mean()
+        vae_loss = recon_loss + self.config.vae_kl_weight * kl_loss
 
         return {
             "loss": vae_loss,

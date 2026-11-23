@@ -3,14 +3,17 @@ import matplotlib.pyplot as plt
 from torchvision.utils import make_grid
 
 
-def save_image_grid(original_images, generated_images, texts, output_path):
+def save_image_grid(original_images, generated_images, texts, output_path, *, target_images=None):
     """保存图像网格"""
     # 将图像从[-1, 1]转换到[0, 1]
     original_images = (original_images + 1) / 2
     generated_images = (generated_images + 1) / 2
 
     # 创建图像网格
-    grid = make_grid(torch.cat([original_images, generated_images], dim=0), nrow=len(original_images))
+    images = [original_images, generated_images]
+    if target_images is not None:
+        images.insert(1, (target_images + 1) / 2)
+    grid = make_grid(torch.cat(images, dim=0), nrow=len(original_images))
 
     # 保存图像
     plt.figure(figsize=(12, 6))

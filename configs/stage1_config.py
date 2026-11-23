@@ -5,6 +5,7 @@ from typing import Optional
 @dataclass
 class Stage1Config(BaseConfig):
     # 训练参数
+    batch_size: int = 4
     num_epochs: int = 50
     learning_rate: float = 5e-4
     weight_decay: float = 1e-4
@@ -12,7 +13,6 @@ class Stage1Config(BaseConfig):
     beta2: float = 0.999
 
     # 模型参数
-    clip_embed_dim: int = 768  # CLIP ViT-L/14 joint embedding space dimension
     aes_num_attributes: int = 5  # 属性数量
 
     # 日志和保存
