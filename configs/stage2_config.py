@@ -34,6 +34,11 @@ class Stage2Config(BaseConfig):
     auxiliary_max_timestep: int = 500
     lambda_id: float = 0.0          # frozen FaceNet identity supervision on generated crops
     identity_weights_path: str = ""
+    identity_exposure_normalization: bool = False
+    faceid_adapter_path: str = ""
+    faceid_encoder_path: str = ""
+    faceid_scale: float = 1.0
+    use_photometric_head: bool = False
     use_geometry_adapter: bool = False
     measured_geometry_probability: float = 0.5
     use_bf16: bool = False
@@ -70,6 +75,10 @@ class Stage2Config(BaseConfig):
     stage1_checkpoint_path: Optional[str] = None  # 第一阶段训练好的模型
 
     def __post_init__(self):
+        if self.faceid_adapter_path and not self.faceid_encoder_path:
+            raise ValueError("FaceID requires the matching buffalo_l encoder")
+        if self.faceid_scale < 0:
+            raise ValueError("faceid_scale must be nonnegative")
         if not 0 <= self.source_edit_probability <= 1:
             raise ValueError("source_edit_probability must be in [0, 1]")
         if not 0 <= self.source_edit_min_timestep < self.source_edit_max_timestep <= self.num_train_timesteps:

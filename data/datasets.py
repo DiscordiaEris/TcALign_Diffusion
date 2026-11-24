@@ -83,10 +83,17 @@ INSTRUCTION_PARAPHRASES = {
 }
 
 
+# Controlled exposures describe target states for all source exposures.
+EXPOSURE_INSTRUCTION_ALIASES = {
+    "Use dim lighting on the face.": "Dim the lighting on the face.",
+    "Use very dim lighting on the face.": "Make the lighting on the face very dim.",
+}
+
+
 def augment_instruction(text):
     """Vary known paired prompts without inventing new target attributes."""
-    alternatives = INSTRUCTION_PARAPHRASES.get(text, ())
-    return random.choice((text, *alternatives)) if alternatives else text
+    alternatives = INSTRUCTION_PARAPHRASES.get(EXPOSURE_INSTRUCTION_ALIASES.get(text, text), ())
+    return random.choice(tuple(dict.fromkeys((text, *alternatives)))) if alternatives else text
 
 
 class FFHQDataset(Dataset):

@@ -14,7 +14,7 @@ class TextConditional3DEditor(nn.Module):
                        'happy', 'frown', 'grin', 'laugh', 'expression', 'emotion'],
         'pose': ['front', 'frontal', 'turn', 'tilt', 'pose', 'look', 'looking',
                  'facing', 'angle', 'view', 'yaw', 'pitch', 'profile', 'rotate'],
-        'lighting': ['bright', 'dim', 'dark', 'natural', 'studio', 'soft',
+        'lighting': ['bright', 'brighter', 'brighten', 'dim', 'dimmer', 'dark', 'darker', 'darken', 'natural', 'studio', 'soft',
                      'shadow', 'lighting', 'illumination', 'light', 'lit', 'relight'],
     }
 

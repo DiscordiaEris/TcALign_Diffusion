@@ -58,6 +58,7 @@ class Stage2Trainer(BaseTrainer):
                          config.source_edit_max_timestep, config.lambda_control,
                          config.lambda_lighting_exposure, config.align_paired_targets)
 
+
         # ── 初始化图像质量指标计算器 ──
         self.metrics_computer = None
         self._fid_real_features_precomputed = False
@@ -133,8 +134,10 @@ class Stage2Trainer(BaseTrainer):
                     num_batches += 1
                     for key in ("loss_diffusion", "loss_diffusion_edit", "loss_identity", "loss_3d", "loss_clip", "loss_control", "source_edit_fraction", "loss_lighting_exposure"):
                         if key in loss_dict:
-                            component_sums[key] += float(loss_dict[key])
-                            component_counts[key] += 1
+                            count = (int(loss_dict["lighting_exposure_sample_count"])
+                                     if key == "loss_lighting_exposure" else 1)
+                            component_sums[key] += float(loss_dict[key]) * count
+                            component_counts[key] += count
 
             if num_batches > 0:
                 avg_loss = total_loss / num_batches

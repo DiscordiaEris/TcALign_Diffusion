@@ -59,6 +59,16 @@ class InferenceSettingsTest(unittest.TestCase):
         config = self.load({"training_config": {"align_paired_targets": True}})
         self.assertTrue(getattr(config, "align_paired_targets", False))
 
+    def test_identity_and_exposure_architecture_is_restored_with_explicit_config(self):
+        config = self.load({"inference_config": {
+            "faceid_adapter_path": "faceid.bin", "faceid_encoder_path": "buffalo.onnx",
+            "faceid_scale": 1.0, "use_photometric_head": True,
+        }}, defaults=False)
+        self.assertEqual(config.faceid_adapter_path, "faceid.bin")
+        self.assertEqual(config.faceid_encoder_path, "buffalo.onnx")
+        self.assertEqual(config.faceid_scale, 1.0)
+        self.assertTrue(config.use_photometric_head)
+
 
 if __name__ == "__main__":
     unittest.main()

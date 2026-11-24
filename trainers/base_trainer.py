@@ -90,7 +90,10 @@ class BaseTrainer:
             checkpoint["inference_use_bf16"] = self.config.use_bf16
             checkpoint["inference_config"] = {
                 name: getattr(self.config, name)
-                for name in ("guidance_scale", "inference_strength", "num_inference_steps", "use_bf16")
+                for name in ("guidance_scale", "inference_strength", "num_inference_steps", "use_bf16",
+                             "faceid_adapter_path", "faceid_encoder_path", "faceid_scale",
+                             "use_photometric_head")
+                if hasattr(self.config, name)
             }
         from dataclasses import asdict, is_dataclass
         if is_dataclass(self.config):

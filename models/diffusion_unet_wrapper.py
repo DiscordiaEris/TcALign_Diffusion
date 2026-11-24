@@ -68,6 +68,11 @@ class DiffusionUNetWrapper(nn.Module):
         # UNet ~860M 参数全量训练会导致 Adam 状态 OOM (24 GB 显存不够)
         self._selectively_freeze_unet(config)
         self.unet.enable_gradient_checkpointing()
+        self.faceid_enabled = bool(config.faceid_adapter_path)
+        if self.faceid_enabled:
+            from .faceid_adapter import install_faceid_adapter
+
+            install_faceid_adapter(self.unet, config.faceid_adapter_path, config.faceid_scale)
         self.geometry_adapter = None
         if getattr(config, "use_geometry_adapter", False):
             # SD 1.5's first three blocks accept residuals before downsampling.
@@ -270,7 +275,7 @@ class DiffusionUNetWrapper(nn.Module):
         return self.geometry_adapter(geometry, latent_size)
 
     def forward(self, noisy_latents, timesteps, condition_embeddings, source_images, source_latents,
-                *, geometry_residuals=None):
+                *, geometry_residuals=None, identity_embeds=None):
         """
         前向传播
 
@@ -289,6 +294,11 @@ class DiffusionUNetWrapper(nn.Module):
         else:
             unet_input = noisy_latents
 
+        identity_kwargs = {}
+        if self.faceid_enabled:
+            if identity_embeds is None:
+                raise ValueError("FaceID enabled but the source identity embedding is missing")
+            identity_kwargs["added_cond_kwargs"] = {"image_embeds": [identity_embeds]}
         noise_pred = self.unet(
             unet_input,
             timesteps,
@@ -297,6 +307,7 @@ class DiffusionUNetWrapper(nn.Module):
             down_intrablock_additional_residuals=(
                 list(geometry_residuals) if geometry_residuals is not None else None
             ),
+            **identity_kwargs,
         ).sample
 
         return noise_pred
@@ -308,39 +319,39 @@ class DiffusionUNetWrapper(nn.Module):
     @torch.no_grad()
     def sample(self, condition_embeddings, source_images, source_latents,
                guidance_scale=7.5, num_inference_steps=50, generator=None, strength=1.0,
-               geometry=None):
+               geometry=None, identity_embeds=None):
         if not 0 < strength <= 1:
             raise ValueError("Image-to-image strength must be in (0, 1]")
         if num_inference_steps < 1:
             raise ValueError("At least one DDIM step is required")
-        scheduler = self.inference_scheduler
+        scheduler = DDIMScheduler.from_config(self.inference_scheduler.config)
         scheduler.set_timesteps(num_inference_steps, device=source_latents.device)
         timesteps = scheduler.timesteps
         batch_size = len(source_latents)
         noise = torch.randn(source_latents.shape, device=source_latents.device,
                             dtype=source_latents.dtype, generator=generator)
         if strength < 1:
-            active_steps = max(1, int(strength * len(timesteps)))
-            timesteps = timesteps[-active_steps:]
+            timesteps = timesteps[-max(1, int(strength * len(timesteps))):]
             latents = scheduler.add_noise(source_latents, noise, timesteps[0].expand(batch_size))
         else:
             latents = noise * scheduler.init_noise_sigma
-
         unconditional = self.encode_prompt([""] * batch_size) if guidance_scale != 1 else None
-        use_bf16 = latents.is_cuda and getattr(self.config, "use_bf16", False) and torch.cuda.is_bf16_supported()
+        negative_identity = torch.zeros_like(identity_embeds) if identity_embeds is not None else None
+        use_bf16 = latents.is_cuda and self.config.use_bf16 and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
-        with torch.cuda.amp.autocast(enabled=latents.is_cuda, dtype=amp_dtype):
-            geometry_residuals = self.geometry_features(geometry, latents.shape[-2:])
-        for timestep in timesteps:
-            t = timestep.expand(batch_size)
-            with torch.cuda.amp.autocast(enabled=latents.is_cuda, dtype=amp_dtype):
-                noise_pred = self(latents, t, condition_embeddings, source_images, source_latents,
-                                  geometry_residuals=geometry_residuals)
+        with torch.amp.autocast(device_type=latents.device.type, enabled=latents.is_cuda, dtype=amp_dtype):
+            residuals = self.geometry_features(geometry, latents.shape[-2:])
+            for timestep in timesteps:
+                t = timestep.expand(batch_size)
+                kwargs = {"identity_embeds": identity_embeds} if identity_embeds is not None else {}
+                prediction = self(latents, t, condition_embeddings, source_images, source_latents,
+                                  geometry_residuals=residuals, **kwargs).float()
                 if unconditional is not None:
+                    kwargs = {"identity_embeds": negative_identity} if identity_embeds is not None else {}
                     baseline = self(latents, t, unconditional, source_images, source_latents,
-                                    geometry_residuals=geometry_residuals)
-                    noise_pred = baseline + guidance_scale * (noise_pred - baseline)
-            latents = scheduler.step(noise_pred.float(), timestep, latents, generator=generator).prev_sample
+                                    geometry_residuals=residuals, **kwargs).float()
+                    prediction = baseline + guidance_scale * (prediction - baseline)
+                latents = scheduler.step(prediction.float(), timestep, latents, generator=generator).prev_sample
         return latents
 
     def compute_vae_loss(self, images, recon_images, kl_weight=1e-6):

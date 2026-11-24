@@ -21,6 +21,11 @@ def _load_config_from_yaml(yaml_path, config_cls):
 def load_generation_checkpoint(config, path, *, use_default_guidance=False):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     state = checkpoint["model_state_dict"]
+    # Architecture is part of the checkpoint contract even with a caller's YAML.
+    saved = checkpoint.get("inference_config", {})
+    for name in ("faceid_adapter_path", "faceid_encoder_path", "faceid_scale", "use_photometric_head"):
+        if name in saved:
+            setattr(config, name, saved[name])
     config.use_geometry_adapter = any(key.startswith("diffusion_unet.geometry_adapter.") for key in state)
     if config.use_geometry_adapter and use_default_guidance:
         config.guidance_scale = checkpoint.get("inference_guidance_scale", 2.5)

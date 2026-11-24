@@ -32,6 +32,8 @@ pytorch3d-0.7.9.tar
 /models/face_detection_yunet_2023mar.onnx
 /models/face_recognition_sface_2021dec.onnx
 /models/facenet/
+/models/insightface/
+/models/ip-adapter-faceid/
 
 # Model checkpoints
 checkpoints/

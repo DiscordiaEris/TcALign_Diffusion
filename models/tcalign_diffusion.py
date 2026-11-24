@@ -38,6 +38,7 @@ class TcAlignDiffusion(nn.Module):
         self.diffusion_mapper = None
         self.diffusion_unet = None
         self.identity_loss = None
+        self.photometric_head = None
 
         print("TcAlignDiffusion model initialized successfully")
         print(f"Using multimodal input: {config.use_multimodal_input}")
@@ -48,6 +49,10 @@ class TcAlignDiffusion(nn.Module):
             self.diffusion_mapper = ConditionalDiffusionMappingNetwork(self.config).to(self.device)
         if self.diffusion_unet is None:
             self.diffusion_unet = DiffusionUNetWrapper(self.config).to(self.device)
+        if getattr(self.config, "use_photometric_head", False) and self.photometric_head is None:
+            from .photometric_exposure import PhotometricExposureHead
+
+            self.photometric_head = PhotometricExposureHead(self.config.condition_embed_dim).to(self.device)
 
     def _checkpoint_keys(self):
         return {name for name, param in self.named_parameters()
@@ -57,7 +62,10 @@ class TcAlignDiffusion(nn.Module):
         if self.config.lambda_id and self.identity_loss is None:
             from .face_identity_loss import FaceIdentityLoss
 
-            self.identity_loss = FaceIdentityLoss(self.config.identity_weights_path).to(self.device).eval()
+            self.identity_loss = FaceIdentityLoss(
+                self.config.identity_weights_path,
+                normalize_exposure=self.config.identity_exposure_normalization,
+            ).to(self.device).eval()
 
     def checkpoint_state(self):
         keys = self._checkpoint_keys()
@@ -126,6 +134,25 @@ class TcAlignDiffusion(nn.Module):
         source_latents = self.diffusion_unet.encode_image(source_images, deterministic=True)
         return source_latents
 
+    def encode_source_identity(self, source_images):
+        if not getattr(self.config, "faceid_adapter_path", ""):
+            return None
+        if not hasattr(self, "faceid_encoder"):
+            from .faceid_adapter import FaceIDSourceEncoder
+
+            self.faceid_encoder = FaceIDSourceEncoder(self.config.faceid_encoder_path, self.deep3d_processor)
+        return self.faceid_encoder.encode(source_images)
+
+    def calibrate_exposure(self, source, generated, texts, tokens, alignment):
+        if getattr(self, "photometric_head", None) is None:
+            return generated
+        from .photometric_exposure import apply_photometric_exposure, explicit_lighting_requests
+
+        return apply_photometric_exposure(
+            self.photometric_head, source, generated, tokens, alignment,
+            explicit_lighting_requests(texts, device=generated.device),
+        )
+
     def train(self, mode=True):
         super().train(mode)
         self.clip_encoder.eval()
@@ -183,6 +210,7 @@ class TcAlignDiffusion(nn.Module):
                     source_alignment, source_images.shape[-2:],
                 )
             source_latents = self.encode_source_images(source_images)
+            source_identity = self.encode_source_identity(source_images)
             target_latents = diffusion.encode_image(target_images)
             dropped = torch.rand(len(delta), device=delta.device) < self.config.cfg_dropout_prob
             if not self.training:
@@ -207,8 +235,11 @@ class TcAlignDiffusion(nn.Module):
             scheduler, target_latents, source_latents, noise, timesteps, source_anchor,
         )
         geometry_residuals = diffusion.geometry_features(geometry, noisy.shape[-2:])
+        identity_kwargs = {}
+        if source_identity is not None:
+            identity_kwargs["identity_embeds"] = source_identity.masked_fill(dropped[:, None, None], 0)
         prediction = diffusion(noisy, timesteps, condition, source_images, source_latents,
-                               geometry_residuals=geometry_residuals)
+                               geometry_residuals=geometry_residuals, **identity_kwargs)
         if scheduler.config.prediction_type == "epsilon":
             denoising_target = effective_noise
         elif scheduler.config.prediction_type == "v_prediction":
@@ -237,15 +268,23 @@ class TcAlignDiffusion(nn.Module):
         if len(editable) and (self.config.lambda_clip or self.config.lambda_3d or self.config.lambda_id or self.config.lambda_control or self.config.lambda_lighting_exposure):
             indices = editable[:self.config.max_clip_grad_samples]
             predicted_images = diffusion.decode_latent_train(predicted_clean[indices])
+            if getattr(self, "photometric_head", None) is not None:
+                predicted_images = self.calibrate_exposure(
+                    source_images[indices], predicted_images, [target_texts[i] for i in indices.tolist()],
+                    text_embeddings[indices], source_alignment[indices],
+                )
             real_images = target_images[indices]
             if self.config.lambda_lighting_exposure:
                 attributes = [self.text_3d_editor.parse_attributes(target_texts[i]) for i in indices.tolist()]
-                exposure_loss = requested_lighting_exposure_loss(
-                    predicted_images, source_images[indices], real_images,
-                    source_alignment[indices], attributes,
-                )
-                loss = loss + self.config.lambda_lighting_exposure * exposure_loss
-                losses["loss_lighting_exposure"] = exposure_loss
+                exposure_count = sum("lighting" in requested for requested in attributes)
+                if exposure_count:
+                    exposure_loss = requested_lighting_exposure_loss(
+                        predicted_images, source_images[indices], real_images,
+                        source_alignment[indices], attributes,
+                    )
+                    loss = loss + self.config.lambda_lighting_exposure * exposure_loss
+                    losses["loss_lighting_exposure"] = exposure_loss
+                    losses["lighting_exposure_sample_count"] = exposure_count
             if self.identity_loss is not None:
                 identity_loss = self.identity_loss(
                     predicted_images, source_images[indices], real_images,
@@ -273,6 +312,8 @@ class TcAlignDiffusion(nn.Module):
                 if self.config.lambda_3d:
                     errors = []
                     for name, group in self.text_3d_editor.attribute_slices.items():
+                        if name == "lighting" and getattr(self, "photometric_head", None) is not None:
+                            continue
                         scale = 3.0 if name == "pose" and geometry is not None else 1.0
                         errors.append(F.smooth_l1_loss(pred_coeff[:, group] * scale, real_coeff[:, group] * scale))
                     geometry_loss = torch.stack(errors).mean()
@@ -283,12 +324,18 @@ class TcAlignDiffusion(nn.Module):
                         source_coeff = self.deep3d_processor.reconstruct_aligned(
                             source_images[indices], source_alignment[indices])
                     attributes = [self.text_3d_editor.parse_attributes(target_texts[i]) for i in indices.tolist()]
-                    control_loss = requested_attribute_control_loss(
-                        pred_coeff, source_coeff, real_coeff, attributes,
-                        self.text_3d_editor.attribute_slices,
-                    )
-                    loss = loss + self.config.lambda_control * control_loss
-                    losses["loss_control"] = control_loss
+                    if getattr(self, "photometric_head", None) is not None:
+                        # Deep3D can absorb exposure into albedo. The explicit
+                        # pixel exposure objective supervises global light gain.
+                        attributes = [[name for name in row if name != "lighting"] for row in attributes]
+                    rows = [i for i, row in enumerate(attributes) if row]
+                    if rows:
+                        control_loss = requested_attribute_control_loss(
+                            pred_coeff[rows], source_coeff[rows], real_coeff[rows],
+                            [attributes[i] for i in rows], self.text_3d_editor.attribute_slices,
+                        )
+                        loss = loss + self.config.lambda_control * control_loss
+                        losses["loss_control"] = control_loss
 
         losses["loss"] = loss
         losses["theta_target"] = theta_0 + delta
@@ -304,7 +351,7 @@ class TcAlignDiffusion(nn.Module):
         if strength is None:
             strength = self.config.inference_strength
         spatial = use_geometry and diffusion.geometry_adapter is not None
-        if spatial and source_alignment is None:
+        if (spatial or self.photometric_head is not None) and source_alignment is None:
             estimated_theta, source_alignment = self.get_3d_params(source_images, return_alignment=True)
             if theta_0 is None:
                 theta_0 = estimated_theta
@@ -313,19 +360,24 @@ class TcAlignDiffusion(nn.Module):
         if delta_theta is None:
             delta_theta = self.predict_delta(theta_0, target_texts, source_rendered)
         source_latents = self.encode_source_images(source_images)
+        source_identity = self.encode_source_identity(source_images)
         geometry = None
         if spatial:
             geometry = align_geometry(
                 self.render_from_params(theta_0 + delta_theta, geometry=True),
                 source_alignment, source_images.shape[-2:],
             )
-        condition = self.diffusion_mapper(delta_theta, source_latents, diffusion.encode_prompt(target_texts))
+        text_tokens = diffusion.encode_prompt(target_texts)
+        condition = self.diffusion_mapper(delta_theta, source_latents, text_tokens)
+        identity_kwargs = {"identity_embeds": source_identity} if source_identity is not None else {}
         generated_latents = diffusion.sample(
             condition, source_images, source_latents, guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps, generator=generator, strength=strength,
             geometry=geometry,
+            **identity_kwargs,
         )
         images = diffusion.decode_latent(generated_latents)
+        images = self.calibrate_exposure(source_images, images, target_texts, text_tokens, source_alignment)
         if not estimate_final_theta:
             return images, None
         return images, self.get_3d_params(images)
