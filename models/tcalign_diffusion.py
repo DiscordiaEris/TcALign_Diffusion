@@ -53,19 +53,43 @@ class TcAlignDiffusion(nn.Module):
             from .photometric_exposure import PhotometricExposureHead
 
             self.photometric_head = PhotometricExposureHead(self.config.condition_embed_dim).to(self.device)
+        self.configure_identity_gain_training()
+
+    def configure_identity_gain_training(self):
+        if not getattr(self.config, "identity_gain_only", False):
+            return
+        if hasattr(self, "_identity_backbone_checkpoint_keys"):
+            return
+        # Frozen fine-tuned weights still belong to this checkpoint. Rebuilding
+        # them from the original SD prior would change the calibrated model.
+        self._identity_backbone_checkpoint_keys = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(".identity_refinement." in name if getattr(
+                self.config, "identity_refinement_rank", 0) else name.endswith(".identity_gain_logit"))
 
     def _checkpoint_keys(self):
-        return {name for name, param in self.named_parameters()
-                if param.requires_grad or name.startswith("text_3d_editor.")}
+        return ({name for name, param in self.named_parameters()
+                 if param.requires_grad or name.startswith("text_3d_editor.")}
+                | getattr(self, "_identity_backbone_checkpoint_keys", set()))
 
     def initialize_identity_loss(self):
         if self.config.lambda_id and self.identity_loss is None:
-            from .face_identity_loss import FaceIdentityLoss
+            if getattr(self.config, "identity_loss_backend", "facenet") == "arcface":
+                from .arcface_identity_loss import ArcFaceIdentityLoss
 
-            self.identity_loss = FaceIdentityLoss(
-                self.config.identity_weights_path,
-                normalize_exposure=self.config.identity_exposure_normalization,
-            ).to(self.device).eval()
+                self.identity_loss = ArcFaceIdentityLoss(
+                    self.config.identity_arcface_weights_path, self.deep3d_processor,
+                    training_alignment=getattr(self.config, "identity_training_alignment", "generated"),
+                ).to(self.device).eval()
+            else:
+                from .face_identity_loss import FaceIdentityLoss
+
+                self.identity_loss = FaceIdentityLoss(
+                    self.config.identity_weights_path,
+                    normalize_exposure=self.config.identity_exposure_normalization,
+                ).to(self.device).eval()
 
     def checkpoint_state(self):
         keys = self._checkpoint_keys()
@@ -158,6 +182,11 @@ class TcAlignDiffusion(nn.Module):
         self.clip_encoder.eval()
         if not any(p.requires_grad for p in self.text_3d_editor.parameters()):
             self.text_3d_editor.eval()
+        if getattr(self.config, "identity_gain_only", False):
+            # Calibration changes gains, never frozen normalization buffers or
+            # dropout behavior relative to the deployed generator.
+            for module in self.children():
+                module.eval()
         return self
 
     def predict_delta(self, theta_0, texts, rendered=None):
@@ -339,6 +368,60 @@ class TcAlignDiffusion(nn.Module):
 
         losses["loss"] = loss
         losses["theta_target"] = theta_0 + delta
+        return losses
+
+    def forward_identity_rollout(self, source_images, target_texts, *, theta_0, target_images,
+                                 source_rendered, source_alignment, target_alignment,
+                                 generator=None):
+        """Calibrate bounded identity gains on the actual deployed trajectory."""
+        self._init_diffusion_modules()
+        self.initialize_identity_loss()
+        diffusion = self.diffusion_unet
+        # Match generation's FP32 frozen conditioning, even inside the trainer's AMP context.
+        with torch.no_grad(), torch.amp.autocast(device_type=source_images.device.type, enabled=False):
+            delta = self.predict_delta(theta_0, target_texts, source_rendered)
+            source_latents = self.encode_source_images(source_images)
+            identity = self.encode_source_identity(source_images)
+            tokens = diffusion.encode_prompt(target_texts)
+            condition = self.diffusion_mapper(delta, source_latents, tokens)
+            geometry = None
+            if diffusion.geometry_adapter is not None:
+                geometry = align_geometry(self.render_from_params(theta_0 + delta, geometry=True),
+                                          source_alignment, source_images.shape[-2:])
+        latents = diffusion.sample_train(
+            condition, source_images, source_latents, geometry=geometry, identity_embeds=identity,
+            guidance_scale=self.config.guidance_scale, num_inference_steps=self.config.num_inference_steps,
+            strength=self.config.inference_strength, generator=generator,
+        )
+        images = diffusion.decode_latent_train(latents)
+        images = self.calibrate_exposure(source_images, images, target_texts, tokens, source_alignment)
+        identity_loss = self.identity_loss(images, source_images, target_images,
+                                           source_alignment, target_alignment)
+        loss = self.config.lambda_id * identity_loss
+        losses = {"loss_final_identity": identity_loss}
+        if hasattr(self.identity_loss, "last_detection_fallbacks"):
+            losses["identity_detection_fallbacks"] = self.identity_loss.last_detection_fallbacks
+        attributes = [self.text_3d_editor.parse_attributes(text) for text in target_texts]
+        if self.config.lambda_lighting_exposure and any("lighting" in row for row in attributes):
+            exposure = requested_lighting_exposure_loss(
+                images, source_images, target_images, source_alignment, attributes)
+            loss = loss + self.config.lambda_lighting_exposure * exposure
+            losses["loss_final_exposure"] = exposure
+        controlled = [[name for name in row if name != "lighting"] for row in attributes]
+        rows = [i for i, row in enumerate(controlled) if row]
+        if self.config.lambda_control and rows:
+            predicted = self.deep3d_processor.reconstruct_aligned(images[rows], target_alignment[rows])
+            with torch.no_grad():
+                target = self.deep3d_processor.reconstruct_aligned(target_images[rows], target_alignment[rows])
+                source = self.deep3d_processor.reconstruct_aligned(source_images[rows], source_alignment[rows])
+            control = requested_attribute_control_loss(predicted, source, target,
+                        [controlled[i] for i in rows], self.text_3d_editor.attribute_slices)
+            loss = loss + self.config.lambda_control * control
+            losses["loss_final_control"] = control
+        gains = [p for name, p in self.named_parameters() if name.endswith(".identity_gain_logit")]
+        regularizer = torch.stack([p.square() for p in gains]).mean()
+        losses["loss_gain_regularizer"] = regularizer
+        losses["loss"] = loss + .001 * regularizer
         return losses
 
     @torch.no_grad()

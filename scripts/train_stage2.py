@@ -8,7 +8,23 @@ from configs.stage2_config import Stage2Config
 from data.datasets import create_dataset, create_training_sampler
 from models.tcalign_diffusion import TcAlignDiffusion
 from trainers.stage2_trainer import Stage2Trainer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from collections import Counter
+
+
+def create_identity_calibration_loader_inputs(dataset, config):
+    """Calibrate on training identities with bounded full-sampler work per epoch."""
+    indices = [i for i, (source, _, text) in enumerate(dataset.metadata)
+               if source.endswith("-11.jpg") and
+               (text.startswith("Turn the head") or text == "Make the person smile.")]
+    if not indices:
+        raise ValueError("Identity calibration requires frontal training edit pairs")
+    counts = Counter(dataset.metadata[i][2] for i in indices)
+    weights = [1. / counts[dataset.metadata[i][2]] for i in indices]
+    sampler = WeightedRandomSampler(weights,
+        config.identity_rollout_steps_per_epoch * config.batch_size, replacement=True,
+        generator=torch.Generator().manual_seed(config.seed))
+    return Subset(dataset, indices), sampler
 
 
 def _load_config_from_yaml(yaml_path, config_cls):
@@ -67,7 +83,10 @@ def main(argv=None):
     # 创建数据加载器
     train_dataset = create_dataset(config, "train")
     val_dataset = create_dataset(config, "val")
-    train_sampler = create_training_sampler(train_dataset, config)
+    if config.identity_gain_only:
+        train_dataset, train_sampler = create_identity_calibration_loader_inputs(train_dataset, config)
+    else:
+        train_sampler = create_training_sampler(train_dataset, config)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -93,6 +112,7 @@ def main(argv=None):
     if args.init_checkpoint:
         checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
         model.load_checkpoint_state(checkpoint["model_state_dict"])
+        trainer.restore_identity_validation(checkpoint)
         trainer.logger.info("Initialized weights from %s at step %s; new optimizer/objective",
                             args.init_checkpoint, checkpoint.get("global_step"))
         del checkpoint

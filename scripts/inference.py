@@ -23,7 +23,8 @@ def load_generation_checkpoint(config, path, *, use_default_guidance=False):
     state = checkpoint["model_state_dict"]
     # Architecture is part of the checkpoint contract even with a caller's YAML.
     saved = checkpoint.get("inference_config", {})
-    for name in ("faceid_adapter_path", "faceid_encoder_path", "faceid_scale", "use_photometric_head"):
+    for name in ("faceid_adapter_path", "faceid_encoder_path", "faceid_scale", "use_photometric_head",
+                 "isolate_faceid_attention", "identity_gain_only", "identity_refinement_rank"):
         if name in saved:
             setattr(config, name, saved[name])
     config.use_geometry_adapter = any(key.startswith("diffusion_unet.geometry_adapter.") for key in state)

@@ -72,7 +72,10 @@ class DiffusionUNetWrapper(nn.Module):
         if self.faceid_enabled:
             from .faceid_adapter import install_faceid_adapter
 
-            install_faceid_adapter(self.unet, config.faceid_adapter_path, config.faceid_scale)
+            install_faceid_adapter(self.unet, config.faceid_adapter_path, config.faceid_scale,
+                                   isolate_attention=config.isolate_faceid_attention,
+                                   train_identity_gain=config.identity_gain_only,
+                                   identity_refinement_rank=getattr(config, "identity_refinement_rank", 0))
         self.geometry_adapter = None
         if getattr(config, "use_geometry_adapter", False):
             # SD 1.5's first three blocks accept residuals before downsampling.
@@ -320,6 +323,27 @@ class DiffusionUNetWrapper(nn.Module):
     def sample(self, condition_embeddings, source_images, source_latents,
                guidance_scale=7.5, num_inference_steps=50, generator=None, strength=1.0,
                geometry=None, identity_embeds=None):
+        return self._sample_impl(
+            condition_embeddings, source_images, source_latents,
+            guidance_scale=guidance_scale, num_inference_steps=num_inference_steps,
+            generator=generator, strength=strength, geometry=geometry,
+            identity_embeds=identity_embeds, checkpoint_denoiser=False,
+        )
+
+    def sample_train(self, condition_embeddings, source_images, source_latents,
+                     guidance_scale=7.5, num_inference_steps=50, generator=None, strength=1.0,
+                     geometry=None, identity_embeds=None, *, checkpoint_denoiser=True):
+        """Differentiate the complete inference trajectory with checkpointed denoisers."""
+        return self._sample_impl(
+            condition_embeddings, source_images, source_latents,
+            guidance_scale=guidance_scale, num_inference_steps=num_inference_steps,
+            generator=generator, strength=strength, geometry=geometry,
+            identity_embeds=identity_embeds, checkpoint_denoiser=checkpoint_denoiser,
+        )
+
+    def _sample_impl(self, condition_embeddings, source_images, source_latents,
+                     guidance_scale, num_inference_steps, generator, strength,
+                     geometry, identity_embeds, *, checkpoint_denoiser):
         if not 0 < strength <= 1:
             raise ValueError("Image-to-image strength must be in (0, 1]")
         if num_inference_steps < 1:
@@ -335,23 +359,38 @@ class DiffusionUNetWrapper(nn.Module):
             latents = scheduler.add_noise(source_latents, noise, timesteps[0].expand(batch_size))
         else:
             latents = noise * scheduler.init_noise_sigma
-        unconditional = self.encode_prompt([""] * batch_size) if guidance_scale != 1 else None
+        # The trainer can have an outer BF16 context. Frozen CFG conditioning
+        # must use the same FP32 encoder as production inference.
+        with torch.amp.autocast(device_type=source_latents.device.type, enabled=False):
+            unconditional = self.encode_prompt([""] * batch_size) if guidance_scale != 1 else None
         negative_identity = torch.zeros_like(identity_embeds) if identity_embeds is not None else None
         use_bf16 = latents.is_cuda and self.config.use_bf16 and torch.cuda.is_bf16_supported()
         amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
         with torch.amp.autocast(device_type=latents.device.type, enabled=latents.is_cuda, dtype=amp_dtype):
             residuals = self.geometry_features(geometry, latents.shape[-2:])
-            for timestep in timesteps:
-                t = timestep.expand(batch_size)
-                kwargs = {"identity_embeds": identity_embeds} if identity_embeds is not None else {}
-                prediction = self(latents, t, condition_embeddings, source_images, source_latents,
-                                  geometry_residuals=residuals, **kwargs).float()
-                if unconditional is not None:
-                    kwargs = {"identity_embeds": negative_identity} if identity_embeds is not None else {}
-                    baseline = self(latents, t, unconditional, source_images, source_latents,
-                                    geometry_residuals=residuals, **kwargs).float()
-                    prediction = baseline + guidance_scale * (prediction - baseline)
-                latents = scheduler.step(prediction.float(), timestep, latents, generator=generator).prev_sample
+
+        def denoise(z, t, tokens, images, source, identity, *geometry_tensors):
+            # Explicit checkpoint arguments retain this call's timestep, CFG
+            # branch, and conditioning when backward revisits earlier steps.
+            kwargs = {"identity_embeds": identity} if identity is not None else {}
+            with torch.amp.autocast(device_type=z.device.type, enabled=z.is_cuda, dtype=amp_dtype):
+                return self(z, t, tokens, images, source,
+                            geometry_residuals=geometry_tensors or None, **kwargs).float()
+
+        def predict(z, t, tokens, identity):
+            arguments = (z, t, tokens, source_images, source_latents, identity, *(residuals or ()))
+            if checkpoint_denoiser and torch.is_grad_enabled():
+                return torch.utils.checkpoint.checkpoint(denoise, *arguments, use_reentrant=False)
+            return denoise(*arguments)
+
+        for timestep in timesteps:
+            t = timestep.expand(batch_size)
+            prediction = predict(latents, t, condition_embeddings, identity_embeds)
+            if unconditional is not None:
+                baseline = predict(latents, t, unconditional, negative_identity)
+                prediction = baseline + guidance_scale * (prediction - baseline)
+            # The denoiser uses BF16/FP16; CFG and scheduler arithmetic stay FP32.
+            latents = scheduler.step(prediction.float(), timestep, latents, generator=generator).prev_sample
         return latents
 
     def compute_vae_loss(self, images, recon_images, kl_weight=1e-6):

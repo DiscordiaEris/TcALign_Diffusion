@@ -3,12 +3,61 @@ from collections import defaultdict
 import torch
 from torch.utils.data import default_collate
 import os
+import math
 
 
 class Stage2Trainer(BaseTrainer):
     """第二阶段训练器：训练条件扩散映射网络 - 支持多模态输入"""
 
+    def on_training_start(self):
+        self.initialize_identity_validation()
+
+    def initialize_identity_validation(self):
+        if not getattr(self.config, "identity_validation_subjects", 0):
+            return
+        gain_only = getattr(self.config, "identity_gain_only", False)
+        # latest is saved before epoch-end validation; the on-disk best can
+        # therefore carry a newer, higher score after an interrupted epoch.
+        directory = getattr(self.config, "checkpoint_dir", None)
+        if directory:
+            path = os.path.join(directory, "best_identity_checkpoint.pth")
+            if os.path.isfile(path):
+                saved = torch.load(path, map_location="cpu", weights_only=True)
+                score = saved.get("identity_validation", {}).get("best_score")
+                current_score = getattr(self, "_best_sampled_identity_score", None)
+                if current_score is None or not math.isfinite(float(current_score)):
+                    current_score = -1.0
+                if score is not None and math.isfinite(float(score)):
+                    self._best_sampled_identity_score = max(
+                        current_score, score)
+                calibration = saved.get("identity_validation", {}).get("calibration", {})
+                if gain_only:
+                    for key in ("expression_baseline", "max_expression_error",
+                                "baseline_progress", "min_expression_progress", "min_arcface_score"):
+                        if key in calibration and not hasattr(self, "_identity_calibration_" + key):
+                            setattr(self, "_identity_calibration_" + key, calibration[key])
+                del saved
+        current_score = getattr(self, "_best_sampled_identity_score", None)
+        if (current_score is not None and math.isfinite(float(current_score))
+                and (not gain_only or hasattr(self, "_identity_calibration_min_expression_progress"))
+                and (getattr(self.config, "identity_loss_backend", "facenet") != "arcface"
+                     or hasattr(self, "_identity_calibration_min_arcface_score"))):
+            return
+        device = torch.device(self.device)
+        devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        was_training = self.model.training
+        self._initializing_identity_validation = True
+        try:
+            self.model.eval()
+            with torch.random.fork_rng(devices=devices):
+                self.validate_sampled_identity()
+        finally:
+            self._initializing_identity_validation = False
+            self.model.train(was_training)
+
     def _optimizer_learning_rate(self, parameter_name):
+        if parameter_name.rsplit(".", 1)[-1] == "identity_gain_logit" or ".identity_refinement." in parameter_name:
+            return self.config.learning_rate
         if (parameter_name.startswith("diffusion_unet.unet.")
                 and not parameter_name.startswith("diffusion_unet.unet.conv_in.")):
             # Preserve the pretrained denoising prior while new source/geometry
@@ -49,14 +98,27 @@ class Stage2Trainer(BaseTrainer):
             self.logger.info("Target geometry adapter enabled; measured training geometry probability %.2f",
                              config.measured_geometry_probability)
         if self.model.identity_loss is not None:
-            self.logger.info("Frozen FaceNet identity loss enabled with weight %.3f", config.lambda_id)
+            self.logger.info("Frozen %s identity loss enabled with weight %.3f",
+                             getattr(config, "identity_loss_backend", "facenet"), config.lambda_id)
         self.optimizer = self.configure_optimizers()
         self.logger.info("Optimizer re-created with diffusion modules included")
-        self.logger.info("Edit training: source_start_probability=%.2f, timestep_range=[%d,%d), "
-                         "control_weight=%.2f, exposure_weight=%.2f, registered_targets=%s",
-                         config.source_edit_probability, config.source_edit_min_timestep,
-                         config.source_edit_max_timestep, config.lambda_control,
-                         config.lambda_lighting_exposure, config.align_paired_targets)
+        if getattr(config, "identity_gain_only", False):
+            active = [(name, parameter) for name, parameter in self.model.named_parameters()
+                      if parameter.requires_grad]
+            refinement = getattr(config, "identity_refinement_rank", 0) > 0
+            if not active or any(not (".identity_refinement." in name if refinement else
+                                     name.endswith(".identity_gain_logit")) for name, _ in active):
+                raise RuntimeError("Identity calibration must only update the selected identity branch")
+            self.logger.info("Identity calibration: %d identity parameters trainable, frozen generator in eval mode; "
+                             "%d full-sampling updates per epoch, learning rate %.6f",
+                             sum(parameter.numel() for _, parameter in active),
+                             config.identity_rollout_steps_per_epoch, config.learning_rate)
+        else:
+            self.logger.info("Edit training: source_start_probability=%.2f, timestep_range=[%d,%d), "
+                             "control_weight=%.2f, exposure_weight=%.2f, registered_targets=%s",
+                             config.source_edit_probability, config.source_edit_min_timestep,
+                             config.source_edit_max_timestep, config.lambda_control,
+                             config.lambda_lighting_exposure, config.align_paired_targets)
 
 
         # ── 初始化图像质量指标计算器 ──
@@ -74,6 +136,12 @@ class Stage2Trainer(BaseTrainer):
                        source_params=None, source_rendered=None, target_images=None,
                        target_params=None, target_alignment=None, source_alignment=None, **kwargs):
         """训练步骤 - 使用预计算参数避免重复跑 Deep3D"""
+        if getattr(self.config, "identity_gain_only", False):
+            return self.model.forward_identity_rollout(
+                source_images, target_texts, theta_0=source_params, target_images=target_images,
+                source_rendered=source_rendered, source_alignment=source_alignment,
+                target_alignment=target_alignment,
+            )
         loss_dict = self.model(
             source_images, target_texts, training_mode="diffusion",
             theta_0=source_params,  # 传入预计算的 3D 参数
@@ -99,6 +167,13 @@ class Stage2Trainer(BaseTrainer):
 
     def _evaluate_fixed_noise(self):
         """评估 - 使用预计算参数避免 Deep3D"""
+        if getattr(self.config, "identity_gain_only", False):
+            was_training = self.model.training
+            try:
+                self.model.eval()
+                return self.validate_sampled_identity()
+            finally:
+                self.model.train(was_training)
         self.model.eval()
         total_loss = 0
         num_batches = 0
@@ -148,6 +223,8 @@ class Stage2Trainer(BaseTrainer):
                                      key, total / count, count)
                 # 生成示例图像
                 self.generate_examples()
+                if getattr(self.config, "identity_validation_subjects", 0):
+                    self.validate_sampled_identity()
 
                 # ── FID 评估 (仅在 epoch 结束时按间隔运行) ──
                 if (self.metrics_computer is not None
@@ -164,6 +241,92 @@ class Stage2Trainer(BaseTrainer):
             self.model.train()
 
         return avg_loss
+
+    @torch.no_grad()
+    def validate_sampled_identity(self):
+        """Retain weights using final-image identity with pose/exposure gates."""
+        import json
+        from pathlib import Path
+        from utils.identity_validation import evaluate_sampled_identity, should_replace_identity_checkpoint
+
+        result = evaluate_sampled_identity(
+            self.model, self.val_dataloader.dataset, self.device,
+            subjects=self.config.identity_validation_subjects, seed=self.config.seed,
+        )
+        metrics = result["aggregate"]
+        self._last_sampled_identity_metrics = metrics
+        path = Path(self.config.output_dir) / f"identity_validation_step_{self.global_step}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+        self.logger.info("Final-sample identity validation: %s", metrics)
+        previous = getattr(self, "_best_sampled_identity_score", -1.)
+        if previous is None or not math.isfinite(float(previous)):
+            previous = -1.0
+        gain_only = getattr(self.config, "identity_gain_only", False)
+        establishing_baseline = gain_only and not hasattr(
+            self, "_identity_calibration_min_expression_progress")
+        if establishing_baseline:
+            try:
+                expression_baseline = float(metrics["expression_error_ratio"])
+                baseline_progress = float(metrics["expression_progress"])
+            except (KeyError, TypeError, ValueError):
+                expression_baseline = math.nan
+                baseline_progress = math.nan
+            if (metrics.get("expression_expected") != 6 or metrics.get("expression_valid") != 6
+                    or metrics.get("expression_progress_valid") != 6
+                    or metrics.get("expression_direction_hits") != 6
+                    or not math.isfinite(expression_baseline) or expression_baseline < 0
+                    or not math.isfinite(baseline_progress) or not 0.1 <= baseline_progress <= 1):
+                raise RuntimeError("Identity calibration requires a finite six-subject expression baseline with six valid directions")
+            self._identity_calibration_expression_baseline = expression_baseline
+            self._identity_calibration_max_expression_error = expression_baseline * 1.1
+            self._identity_calibration_baseline_progress = baseline_progress
+            self._identity_calibration_min_expression_progress = max(0.1, baseline_progress * 0.9)
+            self._identity_calibration_checks_without_improvement = 0
+        if gain_only and not hasattr(self, "_identity_calibration_patience"):
+            self._identity_calibration_patience = getattr(self.config, "identity_calibration_patience", 5)
+        gate_options = ({"require_expression": True,
+                         "max_expression_error": self._identity_calibration_max_expression_error,
+                         "min_expression_progress": self._identity_calibration_min_expression_progress}
+                        if gain_only else {})
+        establishing_arcface_baseline = False
+        if gain_only and getattr(self.config, "identity_loss_backend", "facenet") == "arcface":
+            if not hasattr(self, "_identity_calibration_min_arcface_score"):
+                value = metrics.get("arcface_raw_cosine")
+                if metrics.get("arcface_raw_valid") != 18 or value is None or not math.isfinite(float(value)):
+                    raise RuntimeError("Identity calibration requires a complete ArcFace identity baseline")
+                self._identity_calibration_min_arcface_score = value
+                establishing_arcface_baseline = True
+            gate_options["min_arcface_score"] = self._identity_calibration_min_arcface_score
+        improved = should_replace_identity_checkpoint(metrics, previous, **gate_options)
+        initializing = (establishing_baseline or establishing_arcface_baseline
+                        or getattr(self, "_initializing_identity_validation", False))
+        if gain_only:
+            if improved:
+                self._identity_calibration_checks_without_improvement = 0
+                self.stop_training = False
+            elif (not initializing
+                  and getattr(self, "_identity_calibration_last_validation_epoch", None) != self.epoch):
+                self._identity_calibration_checks_without_improvement = getattr(
+                    self, "_identity_calibration_checks_without_improvement", 0) + 1
+            if not initializing:
+                self._identity_calibration_last_validation_epoch = self.epoch
+            if (getattr(self, "_identity_calibration_checks_without_improvement", 0)
+                    >= self._identity_calibration_patience):
+                self.stop_training = True
+                self.logger.info("Stopping identity calibration after %d epochs without sampled identity improvement",
+                                 self._identity_calibration_checks_without_improvement)
+        if improved:
+            self._best_sampled_identity_score = metrics["identity_score"]
+            checkpoint = os.path.join(self.config.checkpoint_dir, "best_identity_checkpoint.pth")
+            self.save_checkpoint(checkpoint)
+            self.logger.info("Best sampled identity updated: %.4f -> %.4f", previous,
+                             self._best_sampled_identity_score)
+        if gain_only:
+            if not hasattr(self, "_best_sampled_identity_score"):
+                self._best_sampled_identity_score = previous
+            self.save_checkpoint(os.path.join(self.config.checkpoint_dir, "latest_checkpoint.pth"))
+        return metrics
 
     @torch.no_grad()
     def _precompute_real_features_for_fid(self):

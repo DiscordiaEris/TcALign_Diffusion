@@ -92,12 +92,32 @@ class BaseTrainer:
                 name: getattr(self.config, name)
                 for name in ("guidance_scale", "inference_strength", "num_inference_steps", "use_bf16",
                              "faceid_adapter_path", "faceid_encoder_path", "faceid_scale",
-                             "use_photometric_head")
+                             "use_photometric_head", "isolate_faceid_attention", "identity_gain_only",
+                             "identity_refinement_rank")
                 if hasattr(self.config, name)
             }
         from dataclasses import asdict, is_dataclass
         if is_dataclass(self.config):
             checkpoint["training_config"] = asdict(self.config)
+        if hasattr(self, "_best_sampled_identity_score"):
+            checkpoint["identity_validation"] = {
+                "best_score": self._best_sampled_identity_score,
+                "latest": getattr(self, "_last_sampled_identity_metrics", {}),
+            }
+            if hasattr(self, "_identity_calibration_expression_baseline"):
+                checkpoint["identity_validation"]["calibration"] = {
+                    "expression_baseline": self._identity_calibration_expression_baseline,
+                    "max_expression_error": self._identity_calibration_max_expression_error,
+                    "checks_without_improvement": getattr(
+                        self, "_identity_calibration_checks_without_improvement", 0),
+                    "last_validation_epoch": getattr(
+                        self, "_identity_calibration_last_validation_epoch", None),
+                    "patience": getattr(self, "_identity_calibration_patience", 5),
+                }
+                for key in ("baseline_progress", "min_expression_progress", "min_arcface_score"):
+                    if hasattr(self, "_identity_calibration_" + key):
+                        checkpoint["identity_validation"]["calibration"][key] = getattr(
+                            self, "_identity_calibration_" + key)
         temporary_path = checkpoint_path + ".tmp"
         torch.save(checkpoint, temporary_path)
         os.replace(temporary_path, checkpoint_path)
@@ -109,12 +129,37 @@ class BaseTrainer:
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist")
 
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        saved_backend = checkpoint.get("training_config", {}).get("identity_loss_backend", "facenet")
+        if saved_backend != getattr(self.config, "identity_loss_backend", "facenet"):
+            raise ValueError("Cannot resume with a different identity loss backend; initialize weights for a new objective")
+        if (saved_backend == "arcface" and checkpoint.get("training_config", {}).get(
+                "identity_training_alignment", "generated") != getattr(
+                    self.config, "identity_training_alignment", "generated")):
+            raise ValueError("Cannot resume with a different identity training alignment; initialize a new objective")
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.model.load_checkpoint_state(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        self.restore_identity_validation(checkpoint)
         self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+
+    def restore_identity_validation(self, checkpoint):
+        if "identity_validation" in checkpoint:
+            from math import isfinite
+            score = checkpoint["identity_validation"].get("best_score")
+            if score is not None and isfinite(float(score)):
+                self._best_sampled_identity_score = score
+            self._last_sampled_identity_metrics = checkpoint["identity_validation"].get("latest", {})
+            calibration = checkpoint["identity_validation"].get("calibration", {})
+            for key in ("expression_baseline", "max_expression_error", "checks_without_improvement",
+                        "last_validation_epoch", "patience", "baseline_progress", "min_expression_progress",
+                        "min_arcface_score"):
+                if key in calibration:
+                    setattr(self, "_identity_calibration_" + key, calibration[key])
+            if calibration:
+                self.stop_training = (getattr(self, "_identity_calibration_checks_without_improvement", 0)
+                                      >= getattr(self, "_identity_calibration_patience", 5))
 
     def train_one_epoch(self):
         """训练一个epoch"""
@@ -267,9 +312,20 @@ class BaseTrainer:
         if hasattr(self.config, 'resume_from_checkpoint') and self.config.resume_from_checkpoint:
             self.load_checkpoint(self.config.resume_from_checkpoint)
 
+        self.on_training_start()
+
+        if getattr(self, "stop_training", False):
+            self.logger.info("Restored calibration already reached its no-improvement limit")
+            return
+
         for epoch in range(self.epoch, self.config.num_epochs):
             avg_loss = self.train_one_epoch()
             self.logger.info(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+
+            if getattr(self, "stop_training", False):
+                self.save_checkpoint(os.path.join(self.config.checkpoint_dir, "stopped_no_improvement.pth"))
+                self.logger.info("Stopping after sampled identity failed to improve; best checkpoint retained")
+                break
 
             # 保存最终检查点
             if epoch == self.config.num_epochs - 1:
@@ -280,3 +336,7 @@ class BaseTrainer:
                 self.save_checkpoint(checkpoint_path)
 
         self.logger.info("Training completed")
+
+    def on_training_start(self):
+        """Run subclass initialization after every supported resume path."""
+        pass

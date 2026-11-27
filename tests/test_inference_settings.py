@@ -69,6 +69,17 @@ class InferenceSettingsTest(unittest.TestCase):
         self.assertEqual(config.faceid_scale, 1.0)
         self.assertTrue(config.use_photometric_head)
 
+    def test_isolated_identity_projection_architecture_round_trips(self):
+        config = self.load({"inference_config": {"isolate_faceid_attention": True}}, defaults=False)
+        self.assertTrue(getattr(config, "isolate_faceid_attention", False))
+
+    def test_identity_refinement_architecture_restores_before_model_construction(self):
+        config = self.load({"inference_config": {
+            "identity_gain_only": True, "identity_refinement_rank": 2,
+        }}, defaults=False)
+        self.assertTrue(config.identity_gain_only)
+        self.assertEqual(config.identity_refinement_rank, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,7 +33,8 @@ def install_frozen_lora(layer, down, up):
     layer.register_forward_hook(lambda module, args, output: output + module.faceid_lora(args[0]))
 
 
-def install_faceid_adapter(unet, checkpoint_path, scale):
+def install_faceid_adapter(unet, checkpoint_path, scale, *, isolate_attention=False,
+                          train_identity_gain=False, identity_refinement_rank=0):
     weights = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     for index, name in enumerate(list(unet.attn_processors)):
         attention = unet.get_submodule(name.removesuffix(".processor"))
@@ -51,6 +52,17 @@ def install_faceid_adapter(unet, checkpoint_path, scale):
         if hasattr(processor, "scale"):
             processor.scale = [scale]
             processor.requires_grad_(False)
+    if isolate_attention:
+        from .isolated_identity_attention import FrozenIdentityAttnProcessor
+
+        # Called before loading trainable checkpoint weights: private Q/out
+        # always come from the same frozen SD+FaceID base on init and resume.
+        for name, processor in list(unet.attn_processors.items()):
+            if hasattr(processor, "to_k_ip"):
+                attention = unet.get_submodule(name.removesuffix(".processor"))
+                attention.set_processor(FrozenIdentityAttnProcessor(
+                    attention, processor, train_identity_gain=train_identity_gain,
+                    identity_refinement_rank=identity_refinement_rank))
 
 
 class FaceIDSourceEncoder:

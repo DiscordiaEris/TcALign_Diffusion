@@ -5,6 +5,7 @@
 # 或根据你的 CUDA 版本选择 cu118 / cu121 / cu124
 #torch>=2.0.0
 torchvision>=0.15.0
+onnx==1.17.0  # frozen local ArcFace graph for differentiable identity supervision
 torchaudio>=2.0.0
 
 # ==================== 扩散模型相关 ====================
